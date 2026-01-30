@@ -1,0 +1,8 @@
+Data/
+*.npz
+*.vtk
+*.png
+*.nii
+*.nii.gz
+*.ply
+*.log
