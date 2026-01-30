@@ -6,3 +6,6 @@ Data/
 *.nii.gz
 *.ply
 *.log
+__pycache__/
+*.pyc
+_skipped.*
