@@ -1,0 +1,5 @@
+{
+    "notes":  "Legacy run metadata (auto-save not yet enabled during run).",
+    "timestamp":  "2026-01-31 07:24:17",
+    "command":  "python C:/dev/softtissue/sim/preview_fem.py --tet \"C:/dev/softtissue/Data/GM_STL/MRI/tet_mesh_gm_mri_p6.vtk\" --materials \"C:/dev/softtissue/materials.json\" --implicit --steps 4000 --dt 0.001 --damping 0.4 --stiffness-damping 0.05 --gravity-scale 1.0 --gravity-axis=-z --unit-scale 0.001 --fix-axis y --fix-side max --fix-frac 0.3 --fix-extend-axis y --fix-extend-side max --fix-extend-frac 0.05 --record-dir \"C:/dev/softtissue/frames\" --record-every 1 --record-prefix frame --record-format png --record-video \"C:/dev/softtissue/sim.mp4\" --record-fps 30 --out \"C:/dev/softtissue/preview_deformed_from_tet_p6_implicit_record.vtk\""
+}
