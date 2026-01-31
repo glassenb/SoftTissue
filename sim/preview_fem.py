@@ -321,8 +321,33 @@ def setup_plotter(show, surface, grid, record_dir=None):
         return None
     offscreen = bool(record_dir) and not show
     plotter = pv.Plotter(off_screen=offscreen)
-    plotter.add_mesh(surface, color="lightgray", opacity=0.25)
-    plotter.add_mesh(grid, color="tomato", opacity=0.6, show_edges=False)
+    plotter.add_mesh(surface, color="lightgray", opacity=0.1)
+    if "label" in grid.cell_data:
+        # Categorical tissue colors
+        cmap = [
+            "#e0e0e0",  # 0 background
+            "#ff6f91",  # 1 skin (pink)
+            "#ffd166",  # 2 fat (warm yellow)
+            "#8ac926",  # 3 gland (green)
+            "#4ea8de",  # 4 implant (blue)
+            "#1a0a0a",  # 5 tumor (very dark)
+        ]
+        plotter.add_mesh(
+            grid,
+            scalars="label",
+            categories=True,
+            cmap=cmap,
+            opacity=0.8,
+            show_edges=False,
+        )
+        # Tumor overlay for visibility
+        try:
+            tumor = grid.threshold([4.5, 5.5], scalars="label")
+            plotter.add_mesh(tumor, color="#1a0a0a", opacity=0.9, show_edges=False)
+        except Exception:
+            pass
+    else:
+        plotter.add_mesh(grid, color="tomato", opacity=0.6, show_edges=False)
     plotter.add_axes()
     # Default camera: from +Y looking back at the object.
     try:
@@ -331,7 +356,7 @@ def setup_plotter(show, surface, grid, record_dir=None):
         cy = 0.5 * (bounds[2] + bounds[3])
         cz = 0.5 * (bounds[4] + bounds[5])
         size = max(bounds[1] - bounds[0], bounds[3] - bounds[2], bounds[5] - bounds[4])
-        pos = (cx, bounds[3] + 1.5 * size, cz)
+        pos = (cx - 0.6 * size, bounds[3] + 1.2 * size, cz)
         plotter.camera_position = [pos, (cx, cy, cz), (0, 0, 1)]
     except Exception:
         pass
@@ -432,6 +457,9 @@ def select_fixed_dofs(
     fix_extend_axis=None,
     fix_extend_frac=0.0,
     fix_extend_side="max",
+    fix_mode="slab",
+    fix_plane_tol=None,
+    fix_plane_offset=0.0,
 ):
     axis_map = {"x": 0, "y": 1, "z": 2}
     if fix_axis not in axis_map:
@@ -443,10 +471,28 @@ def select_fixed_dofs(
     mins = nodes[:, idx].min()
     maxs = nodes[:, idx].max()
     tol = (maxs - mins) * fix_frac
-    if fix_side == "min":
-        fixed_nodes = np.where(nodes[:, idx] <= mins + tol)[0]
+    if fix_mode == "plane":
+        coords = nodes[:, idx]
+        unique_vals = np.unique(coords)
+        if unique_vals.size > 1:
+            if fix_side == "min":
+                target = unique_vals[0] + float(fix_plane_offset)
+            else:
+                target = unique_vals[-1] - float(fix_plane_offset)
+            if fix_plane_tol is None:
+                diffs = np.diff(unique_vals)
+                min_diff = diffs[diffs > 0].min() if np.any(diffs > 0) else 1e-6
+                tol_plane = 0.5 * float(min_diff)
+            else:
+                tol_plane = float(fix_plane_tol)
+            fixed_nodes = np.where(np.abs(coords - target) <= tol_plane)[0]
+        else:
+            fixed_nodes = np.arange(nodes.shape[0])
     else:
-        fixed_nodes = np.where(nodes[:, idx] >= maxs - tol)[0]
+        if fix_side == "min":
+            fixed_nodes = np.where(nodes[:, idx] <= mins + tol)[0]
+        else:
+            fixed_nodes = np.where(nodes[:, idx] >= maxs - tol)[0]
 
     if fix_extend_axis:
         if fix_extend_axis not in axis_map:
@@ -511,6 +557,9 @@ def main():
     parser.add_argument("--fix-axis", default="x", choices=["x", "y", "z"])
     parser.add_argument("--fix-frac", type=float, default=0.02)
     parser.add_argument("--fix-side", default="min", choices=["min", "max"], help="Clamp min or max side.")
+    parser.add_argument("--fix-mode", default="slab", choices=["slab", "plane"], help="Clamp slab or single plane.")
+    parser.add_argument("--fix-plane-tol", type=float, default=None, help="Tolerance for plane clamp.")
+    parser.add_argument("--fix-plane-offset", type=float, default=0.0, help="Offset plane inward (world units).")
     parser.add_argument("--fix-extend-axis", default=None, choices=["x", "y", "z"])
     parser.add_argument("--fix-extend-frac", type=float, default=0.0, help="Extra clamp band size.")
     parser.add_argument(
@@ -542,6 +591,8 @@ def main():
     parser.add_argument("--record-video", default=None, help="Output video path (mp4).")
     parser.add_argument("--record-fps", type=int, default=30, help="FPS for encoded video.")
     parser.add_argument("--record-real-time", action="store_true", help="Match recorded frame rate to dt.")
+    parser.add_argument("--stop-vel", type=float, default=0.0, help="Auto-stop when max speed < threshold (world units/s).")
+    parser.add_argument("--stop-steps", type=int, default=50, help="Consecutive steps below threshold before stop.")
     parser.add_argument("--decimate", type=float, default=0.0, help="Target reduction 0-1.")
     parser.add_argument("--no-meshfix", action="store_true", help="Skip meshfix repair.")
     parser.add_argument("--keep-all", action="store_true", help="Keep all connected components.")
@@ -624,6 +675,9 @@ def main():
         args.fix_extend_axis,
         args.fix_extend_frac,
         args.fix_extend_side,
+        args.fix_mode,
+        args.fix_plane_tol,
+        args.fix_plane_offset,
     )
     report_axis = args.report_axis or axis_from_gravity(args.gravity_axis)
     start_stats = axis_stats(nodes, report_axis)
@@ -639,6 +693,8 @@ def main():
         if args.quasi_static:
             solver, free = make_static_solver(K, fixed_dofs)
             u = np.zeros(ndof, dtype=float)
+            prev_u = None
+            stop_count = 0
             frame_idx = 0
             for step in range(args.steps):
                 if args.gravity_ramp and args.gravity_ramp > 0:
@@ -648,6 +704,19 @@ def main():
                 f_step = f * ramp
                 u[:] = 0.0
                 u[free] = solver(f_step[free])
+                if args.stop_vel > 0:
+                    if prev_u is None:
+                        prev_u = u.copy()
+                    du = (u - prev_u).reshape(-1, 3) / unit_scale
+                    max_step = float(np.linalg.norm(du, axis=1).max())
+                    if max_step < args.stop_vel:
+                        stop_count += 1
+                    else:
+                        stop_count = 0
+                    prev_u = u.copy()
+                    if stop_count >= max(1, args.stop_steps):
+                        print(f"Stopping early at step {step} (max step {max_step:.6f}).")
+                        break
 
                 if plotter is not None:
                     u_world = u.reshape(-1, 3) / unit_scale
@@ -673,6 +742,7 @@ def main():
             record_every = args.record_every
             if args.record_real_time:
                 record_every = max(1, int(round(1.0 / (max(1e-8, dt) * float(args.record_fps)))))
+            stop_count = 0
             # Rayleigh damping: C = alpha*M + beta*K
             alpha = float(args.damping)
             beta = float(args.stiffness_damping)
@@ -700,6 +770,16 @@ def main():
                 u += dt * v
                 u[fixed_dofs] = 0.0
                 v[fixed_dofs] = 0.0
+                if args.stop_vel > 0:
+                    v_world = v.reshape(-1, 3) / unit_scale
+                    max_speed = float(np.linalg.norm(v_world, axis=1).max())
+                    if max_speed < args.stop_vel:
+                        stop_count += 1
+                    else:
+                        stop_count = 0
+                    if stop_count >= max(1, args.stop_steps):
+                        print(f"Stopping early at step {step} (max speed {max_speed:.6f}).")
+                        break
 
                 if plotter is not None:
                     u_world = u.reshape(-1, 3) / unit_scale
@@ -728,6 +808,7 @@ def main():
             if args.record_real_time:
                 record_every = max(1, int(round(1.0 / (max(1e-8, dt) * float(args.record_fps)))))
             frame_idx = 0
+            stop_count = 0
             for step in range(args.steps):
                 if args.gravity_ramp and args.gravity_ramp > 0:
                     ramp = min(1.0, (step + 1) / float(args.gravity_ramp))
@@ -749,6 +830,16 @@ def main():
                     u += dt * v
                     u[fixed_dofs] = 0.0
                     v[fixed_dofs] = 0.0
+                if args.stop_vel > 0:
+                    v_world = v.reshape(-1, 3) / unit_scale
+                    max_speed = float(np.linalg.norm(v_world, axis=1).max())
+                    if max_speed < args.stop_vel:
+                        stop_count += 1
+                    else:
+                        stop_count = 0
+                    if stop_count >= max(1, args.stop_steps):
+                        print(f"Stopping early at step {step} (max speed {max_speed:.6f}).")
+                        break
 
                 if plotter is not None:
                     u_world = u.reshape(-1, 3) / unit_scale
