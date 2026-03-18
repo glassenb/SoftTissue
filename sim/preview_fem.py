@@ -332,6 +332,8 @@ def setup_plotter(show, surface, grid, record_dir=None, camera_y_side="max"):
             "#8ac926",  # 3 gland (green)
             "#4ea8de",  # 4 implant (blue)
             "#1a0a0a",  # 5 tumor (very dark)
+            "#7a6ff0",  # 6 muscle (indigo)
+            "#fff2b2",  # 7 nipple (pale yellow)
         ]
         plotter.add_mesh(
             grid,

@@ -1,0 +1,34 @@
+{
+  "pitch": 6.0,
+  "resolve": "overwrite",
+  "threshold": 0.0,
+  "out": "../../Data/SA_SEGMENTATION/normalized/sa_ct_volume_p6.npz",
+  "meta": "../../Data/SA_SEGMENTATION/normalized/sa_ct_volume_p6.json",
+  "masks": [
+    {
+      "path": "../../Data/SA_SEGMENTATION/SA_CT/SA_CT/CT skin remainer.nii",
+      "label": 2,
+      "name": "ct_soft_tissue_fill"
+    },
+    {
+      "path": "../../Data/SA_SEGMENTATION/SA_CT/SA_CT/CT muscle.nii",
+      "label": 6,
+      "name": "ct_muscle"
+    },
+    {
+      "path": "../../Data/SA_SEGMENTATION/SA_CT/SA_CT/CT nipple Lt.nii",
+      "label": 7,
+      "name": "ct_nipple_left"
+    },
+    {
+      "path": "../../Data/SA_SEGMENTATION/SA_CT/SA_CT/CT nipple Rt.nii",
+      "label": 7,
+      "name": "ct_nipple_right"
+    },
+    {
+      "path": "../../Data/SA_SEGMENTATION/SA_CT/SA_CT/CT skin outer layer.nii",
+      "label": 1,
+      "name": "ct_skin_outer"
+    }
+  ]
+}
