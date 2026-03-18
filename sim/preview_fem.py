@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import subprocess
+import shutil
 
 import numpy as np
 import pyvista as pv
@@ -316,7 +317,7 @@ def axis_from_gravity(gravity_axis):
     return axis if axis in {"x", "y", "z"} else "z"
 
 
-def setup_plotter(show, surface, grid, record_dir=None):
+def setup_plotter(show, surface, grid, record_dir=None, camera_y_side="max"):
     if not show and not record_dir:
         return None
     offscreen = bool(record_dir) and not show
@@ -356,7 +357,11 @@ def setup_plotter(show, surface, grid, record_dir=None):
         cy = 0.5 * (bounds[2] + bounds[3])
         cz = 0.5 * (bounds[4] + bounds[5])
         size = max(bounds[1] - bounds[0], bounds[3] - bounds[2], bounds[5] - bounds[4])
-        pos = (cx - 0.6 * size, bounds[3] + 1.2 * size, cz)
+        if camera_y_side == "min":
+            cam_y = bounds[2] - 1.2 * size
+        else:
+            cam_y = bounds[3] + 1.2 * size
+        pos = (cx - 0.6 * size, cam_y, cz)
         plotter.camera_position = [pos, (cx, cy, cz), (0, 0, 1)]
     except Exception:
         pass
@@ -408,6 +413,74 @@ def load_materials_text(path):
             return f.read()
     except Exception:
         return None
+
+
+def strip_json_comments(text):
+    out = []
+    i = 0
+    n = len(text)
+    in_str = False
+    esc = False
+    in_line = False
+    in_block = False
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if in_line:
+            if ch == "\n":
+                in_line = False
+                out.append(ch)
+            i += 1
+            continue
+        if in_block:
+            if ch == "*" and nxt == "/":
+                in_block = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == "\"":
+                in_str = False
+            i += 1
+            continue
+        if ch == "\"":
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            in_line = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block = True
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def load_config(path):
+    with open(path, "r", encoding="utf-8-sig") as f:
+        text = f.read()
+    text = strip_json_comments(text)
+    return json.loads(text)
+
+
+def apply_config(args, config, parser):
+    for key, value in config.items():
+        if not hasattr(args, key):
+            continue
+        default = parser.get_default(key)
+        if getattr(args, key) == default:
+            setattr(args, key, value)
 
 
 def write_run_metadata(path_base, args, start_stats, end_stats):
@@ -545,7 +618,11 @@ def main():
     parser.add_argument("--stl", help="Path to outer surface STL.")
     parser.add_argument("--tet", help="Path to tet mesh VTK.")
     parser.add_argument("--tet-npz", help="Path to tet mesh NPZ (nodes, tets).")
-    parser.add_argument("--out", default="preview_deformed.vtk", help="Output VTK path.")
+    parser.add_argument(
+        "--out",
+        default="outputs/previews/preview_deformed.vtk",
+        help="Output VTK path.",
+    )
     parser.add_argument("--max-volume", type=float, default=None, help="Tet max volume.")
     parser.add_argument("--E", type=float, default=2.0e4, help="Young's modulus.")
     parser.add_argument("--nu", type=float, default=0.45, help="Poisson ratio.")
@@ -576,6 +653,12 @@ def main():
     parser.add_argument("--damping", type=float, default=0.02, help="Velocity damping coefficient.")
     parser.add_argument("--stiffness-damping", type=float, default=0.0, help="Stiffness-proportional damping.")
     parser.add_argument("--fps", type=float, default=30.0, help="Target FPS for realtime preview.")
+    parser.add_argument(
+        "--camera-y-side",
+        default="max",
+        choices=["min", "max"],
+        help="Place camera on the min or max Y side of the mesh.",
+    )
     parser.add_argument("--quasi-static", action="store_true", help="Solve static K u = f each frame.")
     parser.add_argument("--implicit", action="store_true", help="Use implicit (backward Euler) dynamics.")
     parser.add_argument("--substeps", type=int, default=1, help="Substeps per frame.")
@@ -593,6 +676,7 @@ def main():
     parser.add_argument("--record-real-time", action="store_true", help="Match recorded frame rate to dt.")
     parser.add_argument("--stop-vel", type=float, default=0.0, help="Auto-stop when max speed < threshold (world units/s).")
     parser.add_argument("--stop-steps", type=int, default=50, help="Consecutive steps below threshold before stop.")
+    parser.add_argument("--config", default=None, help="JSON config file (supports // and /* */ comments).")
     parser.add_argument("--decimate", type=float, default=0.0, help="Target reduction 0-1.")
     parser.add_argument("--no-meshfix", action="store_true", help="Skip meshfix repair.")
     parser.add_argument("--keep-all", action="store_true", help="Keep all connected components.")
@@ -600,6 +684,15 @@ def main():
     parser.add_argument("--screenshot", default=None, help="PNG path for preview.")
     parser.add_argument("--show", action="store_true", help="Show interactive plot.")
     args = parser.parse_args()
+    if args.config:
+        if not os.path.isfile(args.config):
+            print(f"Config file not found: {args.config}")
+            return 1
+        config = load_config(args.config)
+        if not isinstance(config, dict):
+            print("Config must be a JSON object with key/value pairs.")
+            return 1
+        apply_config(args, config, parser)
 
     labels = None
     if args.tet or args.tet_npz:
@@ -687,7 +780,7 @@ def main():
         ndof = nodes.shape[0] * 3
         if args.record_dir:
             os.makedirs(args.record_dir, exist_ok=True)
-        plotter = setup_plotter(args.show, surface, grid, args.record_dir)
+        plotter = setup_plotter(args.show, surface, grid, args.record_dir, args.camera_y_side)
 
         last_time = time.time()
         if args.quasi_static:
@@ -881,7 +974,6 @@ def main():
             plotter.show()
         meta_base = None
         if args.record_video:
-            meta_base = os.path.splitext(args.record_video)[0]
             encode_video(
                 args.record_dir,
                 args.record_prefix,
@@ -889,9 +981,16 @@ def main():
                 args.record_fps,
                 args.record_video,
             )
+            meta_base = os.path.splitext(args.record_video)[0]
+            if args.config:
+                try:
+                    shutil.copyfile(args.config, args.record_video + ".json")
+                except Exception:
+                    pass
+                meta_base = meta_base + ".meta"
+            write_run_metadata(meta_base, args, start_stats, end_stats)
         elif args.record_dir:
             meta_base = os.path.join(args.record_dir, args.record_prefix)
-        if meta_base:
             write_run_metadata(meta_base, args, start_stats, end_stats)
     else:
         u = solve_static(K, f, fixed_dofs).reshape(-1, 3)
@@ -919,7 +1018,14 @@ def main():
             elif args.show:
                 plotter.show()
         if args.record_video:
-            write_run_metadata(os.path.splitext(args.record_video)[0], args, start_stats, end_stats)
+            meta_base = os.path.splitext(args.record_video)[0]
+            if args.config:
+                try:
+                    shutil.copyfile(args.config, args.record_video + ".json")
+                except Exception:
+                    pass
+                meta_base = meta_base + ".meta"
+            write_run_metadata(meta_base, args, start_stats, end_stats)
 
     return 0
 

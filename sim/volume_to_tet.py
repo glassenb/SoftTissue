@@ -4,7 +4,6 @@ import sys
 
 import numpy as np
 import pyvista as pv
-import tetgen
 
 
 def load_volume(npz_path):
@@ -29,12 +28,57 @@ def volume_surface(grid):
 
 
 def tetrahedralize(surface, max_volume=None, mindihedral=10, minratio=1.5):
+    try:
+        import tetgen
+    except Exception as exc:
+        raise RuntimeError("tetgen is required for surface tetrahedralization.") from exc
     tg = tetgen.TetGen(surface)
     kwargs = {"order": 1, "mindihedral": mindihedral, "minratio": minratio}
     if max_volume is not None:
         kwargs["maxvolume"] = max_volume
     tg.tetrahedralize(**kwargs)
     return tg.grid
+
+
+def voxel_tet_mesh(volume, origin, pitch):
+    nx, ny, nz = volume.shape
+    gx = np.arange(nx + 1) * pitch + origin[0]
+    gy = np.arange(ny + 1) * pitch + origin[1]
+    gz = np.arange(nz + 1) * pitch + origin[2]
+    grid_x, grid_y, grid_z = np.meshgrid(gx, gy, gz, indexing="ij")
+    nodes = np.stack([grid_x, grid_y, grid_z], axis=-1).reshape(-1, 3)
+
+    def vid(i, j, k):
+        return i * (ny + 1) * (nz + 1) + j * (nz + 1) + k
+
+    filled = np.argwhere(volume > 0)
+    tets = []
+    labels = []
+    for i, j, k in filled:
+        v000 = vid(i, j, k)
+        v100 = vid(i + 1, j, k)
+        v010 = vid(i, j + 1, k)
+        v110 = vid(i + 1, j + 1, k)
+        v001 = vid(i, j, k + 1)
+        v101 = vid(i + 1, j, k + 1)
+        v011 = vid(i, j + 1, k + 1)
+        v111 = vid(i + 1, j + 1, k + 1)
+        # 6-tet split along body diagonal (v000-v111)
+        tets.extend(
+            [
+                (v000, v100, v110, v111),
+                (v000, v110, v010, v111),
+                (v000, v010, v011, v111),
+                (v000, v011, v001, v111),
+                (v000, v001, v101, v111),
+                (v000, v101, v100, v111),
+            ]
+        )
+        labels.extend([int(volume[i, j, k])] * 6)
+
+    tets = np.array(tets, dtype=np.int64)
+    labels = np.array(labels, dtype=np.uint16)
+    return nodes, tets, labels
 
 
 def label_tets(nodes, tets, volume, origin, pitch):
@@ -61,6 +105,7 @@ def main():
     parser.add_argument("--max-volume", type=float, default=None, help="Tet max volume.")
     parser.add_argument("--decimate", type=float, default=0.0, help="Surface decimation 0-1.")
     parser.add_argument("--smooth", type=int, default=0, help="Surface smoothing iterations.")
+    parser.add_argument("--voxel-tets", action="store_true", help="Generate tets directly from voxels.")
     args = parser.parse_args()
 
     if not os.path.isfile(args.npz):
@@ -69,24 +114,39 @@ def main():
 
     volume, origin, pitch = load_volume(args.npz)
     grid = make_grid(volume, origin, pitch)
-    surface = volume_surface(grid)
+    if args.voxel_tets:
+        nodes, tets, labels = voxel_tet_mesh(volume, origin, pitch)
+        cells = np.hstack([np.full((len(tets), 1), 4, dtype=np.int64), tets]).reshape(-1)
+        celltypes = np.full(len(tets), pv.CellType.TETRA, dtype=np.uint8)
+        grid_tet = pv.UnstructuredGrid(cells, celltypes, nodes)
+        grid_tet.cell_data["label"] = labels
+    else:
+        surface = volume_surface(grid)
 
-    if args.decimate > 0:
+        if args.decimate > 0:
+            try:
+                surface = surface.decimate_pro(target_reduction=args.decimate)
+            except TypeError:
+                surface = surface.decimate_pro(reduction=args.decimate)
+        if args.smooth > 0:
+            surface = surface.smooth(n_iter=args.smooth)
+
         try:
-            surface = surface.decimate_pro(target_reduction=args.decimate)
-        except TypeError:
-            surface = surface.decimate_pro(reduction=args.decimate)
-    if args.smooth > 0:
-        surface = surface.smooth(n_iter=args.smooth)
+            grid_tet = tetrahedralize(surface, max_volume=args.max_volume)
+        except Exception as exc:
+            print(f"Tetgen failed ({exc}); falling back to voxel tets.")
+            nodes, tets, labels = voxel_tet_mesh(volume, origin, pitch)
+            cells = np.hstack([np.full((len(tets), 1), 4, dtype=np.int64), tets]).reshape(-1)
+            celltypes = np.full(len(tets), pv.CellType.TETRA, dtype=np.uint8)
+            grid_tet = pv.UnstructuredGrid(cells, celltypes, nodes)
+            grid_tet.cell_data["label"] = labels
+        else:
+            cells = grid_tet.cells.reshape(-1, 5)
+            tets = cells[:, 1:5].astype(int)
+            nodes = grid_tet.points.astype(float)
 
-    grid_tet = tetrahedralize(surface, max_volume=args.max_volume)
-
-    cells = grid_tet.cells.reshape(-1, 5)
-    tets = cells[:, 1:5].astype(int)
-    nodes = grid_tet.points.astype(float)
-
-    labels = label_tets(nodes, tets, volume, origin, pitch)
-    grid_tet.cell_data["label"] = labels
+            labels = label_tets(nodes, tets, volume, origin, pitch)
+            grid_tet.cell_data["label"] = labels
 
     grid_tet.save(args.out)
     print(f"Saved tet mesh: {args.out}")
