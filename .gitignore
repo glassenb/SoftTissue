@@ -11,5 +11,6 @@ __pycache__/
 _skipped.*
 *.mp4
 frames/
+videos/frames_*/
 videos/*.json
 videos/*.md

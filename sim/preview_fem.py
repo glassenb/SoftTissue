@@ -5,6 +5,8 @@ import sys
 import time
 import subprocess
 import shutil
+import threading
+import traceback
 
 import numpy as np
 import pyvista as pv
@@ -317,7 +319,17 @@ def axis_from_gravity(gravity_axis):
     return axis if axis in {"x", "y", "z"} else "z"
 
 
-def setup_plotter(show, surface, grid, record_dir=None, camera_y_side="max"):
+def setup_plotter(
+    show,
+    surface,
+    grid,
+    record_dir=None,
+    camera_y_side="max",
+    fixed_points=None,
+    fixed_points_mode="auto",
+    max_fixed_points_render=5000,
+    interactive_state=None,
+):
     if not show and not record_dir:
         return None
     offscreen = bool(record_dir) and not show
@@ -334,6 +346,7 @@ def setup_plotter(show, surface, grid, record_dir=None, camera_y_side="max"):
             "#1a0a0a",  # 5 tumor (very dark)
             "#7a6ff0",  # 6 muscle (indigo)
             "#fff2b2",  # 7 nipple (pale yellow)
+            "#4b3f2f",  # 8 anchor / bone proxy (dark brown)
         ]
         plotter.add_mesh(
             grid,
@@ -351,6 +364,22 @@ def setup_plotter(show, surface, grid, record_dir=None, camera_y_side="max"):
             pass
     else:
         plotter.add_mesh(grid, color="tomato", opacity=0.6, show_edges=False)
+    if fixed_points is not None and len(fixed_points) > 0:
+        pts = fixed_points
+        if max_fixed_points_render and len(pts) > max_fixed_points_render:
+            step = max(1, int(np.ceil(len(pts) / float(max_fixed_points_render))))
+            pts = pts[::step]
+        render_mode = fixed_points_mode
+        if render_mode == "auto":
+            render_mode = "spheres" if len(pts) <= 2000 else "points"
+        if render_mode != "off" and len(pts) > 0:
+            plotter.add_points(
+                pts,
+                color="#b00020",
+                point_size=6 if render_mode == "spheres" else 3,
+                render_points_as_spheres=(render_mode == "spheres"),
+                opacity=0.9,
+            )
     plotter.add_axes()
     # Default camera: from +Y looking back at the object.
     try:
@@ -368,6 +397,14 @@ def setup_plotter(show, surface, grid, record_dir=None, camera_y_side="max"):
     except Exception:
         pass
     if show:
+        state = interactive_state if interactive_state is not None else {}
+        state.setdefault("paused", False)
+
+        def toggle_pause():
+            state["paused"] = not state["paused"]
+            print("Paused interactive playback." if state["paused"] else "Resumed interactive playback.")
+
+        plotter.add_key_event("p", toggle_pause)
         plotter.show(auto_close=False, interactive_update=True)
     return plotter
 
@@ -524,7 +561,15 @@ def write_run_metadata(path_base, args, start_stats, end_stats):
         pass
 
 
-def select_fixed_dofs(
+def fixed_nodes_to_dofs(fixed_nodes):
+    fixed_dofs = np.empty(len(fixed_nodes) * 3, dtype=int)
+    fixed_dofs[0::3] = fixed_nodes * 3
+    fixed_dofs[1::3] = fixed_nodes * 3 + 1
+    fixed_dofs[2::3] = fixed_nodes * 3 + 2
+    return fixed_dofs
+
+
+def select_fixed_nodes_geometry(
     nodes,
     fix_axis="x",
     fix_frac=0.02,
@@ -585,11 +630,18 @@ def select_fixed_dofs(
                 extra = np.where(nodes[:, eidx] >= emaxs - etol)[0]
             fixed_nodes = np.unique(np.concatenate([fixed_nodes, extra]))
 
-    fixed_dofs = np.empty(len(fixed_nodes) * 3, dtype=int)
-    fixed_dofs[0::3] = fixed_nodes * 3
-    fixed_dofs[1::3] = fixed_nodes * 3 + 1
-    fixed_dofs[2::3] = fixed_nodes * 3 + 2
-    return fixed_dofs
+    return fixed_nodes
+
+
+def select_fixed_nodes_labels(tets, labels, fix_labels):
+    if labels is None:
+        raise ValueError("Per-tet labels are required for --fix-label.")
+    if not fix_labels:
+        return np.zeros(0, dtype=int)
+    target = np.isin(labels, np.asarray(fix_labels, dtype=int))
+    if not np.any(target):
+        return np.zeros(0, dtype=int)
+    return np.unique(tets[target].reshape(-1))
 
 
 def solve_static(K, f, fixed_dofs):
@@ -615,6 +667,223 @@ def make_static_solver(K, fixed_dofs):
     return solver, free
 
 
+def run_dynamic_interactive_async(plotter, grid, nodes, K, f, fixed_dofs, masses, args, unit_scale, report_axis, interactive_state):
+    ndof = nodes.shape[0] * 3
+    render_every = 1
+    if args.fps > 0 and args.dt > 0:
+        render_every = max(1, int(round(1.0 / (float(args.dt) * float(args.fps)))))
+
+    shared = {
+        "points": nodes.copy(),
+        "dirty": True,
+        "done": False,
+        "error": None,
+        "traceback": None,
+        "end_stats": None,
+    }
+    lock = threading.Lock()
+    stop_event = threading.Event()
+
+    def publish(u_vec, step, force=False):
+        if (not force) and (step % max(1, render_every) != 0):
+            return
+        u_world = u_vec.reshape(-1, 3) / unit_scale
+        points = nodes + u_world * args.scale
+        with lock:
+            shared["points"] = points
+            shared["dirty"] = True
+
+    def worker():
+        try:
+            if args.quasi_static:
+                solver, free = make_static_solver(K, fixed_dofs)
+                u = np.zeros(ndof, dtype=float)
+                prev_u = None
+                stop_count = 0
+                for step in range(args.steps):
+                    if stop_event.is_set():
+                        break
+                    while interactive_state.get("paused", False) and not stop_event.is_set():
+                        time.sleep(0.03)
+                    if args.gravity_ramp and args.gravity_ramp > 0:
+                        ramp = min(1.0, (step + 1) / float(args.gravity_ramp))
+                    else:
+                        ramp = 1.0
+                    f_step = f * ramp
+                    u[:] = 0.0
+                    u[free] = solver(f_step[free])
+                    if args.stop_vel > 0:
+                        if prev_u is None:
+                            prev_u = u.copy()
+                        du = (u - prev_u).reshape(-1, 3) / unit_scale
+                        max_step = float(np.linalg.norm(du, axis=1).max())
+                        if max_step < args.stop_vel:
+                            stop_count += 1
+                        else:
+                            stop_count = 0
+                        prev_u[:] = u
+                        if stop_count >= max(1, args.stop_steps):
+                            print(f"Stopping early at step {step} (max step {max_step:.6f}).")
+                            break
+                    publish(u, step)
+            elif args.implicit:
+                u = np.zeros(ndof, dtype=float)
+                v = np.zeros(ndof, dtype=float)
+                m_dof = np.repeat(masses, 3)
+                m_dof[m_dof == 0] = 1.0
+                dt = float(args.dt)
+                stop_count = 0
+                alpha = float(args.damping)
+                beta = float(args.stiffness_damping)
+                c_dof = alpha * m_dof
+                free = np.setdiff1d(np.arange(ndof), fixed_dofs)
+                A_diag = m_dof + dt * c_dof
+                K_scaled = (dt * dt + dt * beta) * K
+                A = sp.diags(A_diag, format="csc") + K_scaled
+                A_ff = A[free, :][:, free]
+                print("Preparing implicit solver...")
+                solver = spla.factorized(A_ff)
+                print("Implicit solver ready.")
+
+                for step in range(args.steps):
+                    if stop_event.is_set():
+                        break
+                    while interactive_state.get("paused", False) and not stop_event.is_set():
+                        time.sleep(0.03)
+                    if args.gravity_ramp and args.gravity_ramp > 0:
+                        ramp = min(1.0, (step + 1) / float(args.gravity_ramp))
+                    else:
+                        ramp = 1.0
+                    f_step = f * ramp
+
+                    rhs = m_dof * v + dt * (f_step - K @ u)
+                    v_new = np.zeros_like(v)
+                    v_new[free] = solver(rhs[free])
+                    v = v_new
+                    u += dt * v
+                    u[fixed_dofs] = 0.0
+                    v[fixed_dofs] = 0.0
+                    if args.stop_vel > 0:
+                        v_world = v.reshape(-1, 3) / unit_scale
+                        max_speed = float(np.linalg.norm(v_world, axis=1).max())
+                        if max_speed < args.stop_vel:
+                            stop_count += 1
+                        else:
+                            stop_count = 0
+                        if stop_count >= max(1, args.stop_steps):
+                            print(f"Stopping early at step {step} (max speed {max_speed:.6f}).")
+                            break
+                    publish(u, step)
+            else:
+                u = np.zeros(ndof, dtype=float)
+                v = np.zeros(ndof, dtype=float)
+                m_dof = np.repeat(masses, 3)
+                m_dof[m_dof == 0] = 1.0
+                dt = float(args.dt)
+                substeps = max(1, int(args.substeps))
+                max_disp = float(args.max_disp) * unit_scale
+                stop_count = 0
+                for step in range(args.steps):
+                    if stop_event.is_set():
+                        break
+                    while interactive_state.get("paused", False) and not stop_event.is_set():
+                        time.sleep(0.03)
+                    if args.gravity_ramp and args.gravity_ramp > 0:
+                        ramp = min(1.0, (step + 1) / float(args.gravity_ramp))
+                    else:
+                        ramp = 1.0
+                    f_step = f * ramp
+
+                    for _ in range(substeps):
+                        Ku = K @ u
+                        a = (f_step - Ku - args.damping * v) / m_dof
+                        v += dt * a
+                        if max_disp > 0:
+                            v3 = v.reshape(-1, 3)
+                            speed = np.linalg.norm(v3, axis=1)
+                            max_vel = max_disp / max(dt, 1e-8)
+                            scale = np.minimum(1.0, max_vel / (speed + 1e-12))
+                            v3 *= scale[:, None]
+                            v = v3.reshape(-1)
+                        u += dt * v
+                        u[fixed_dofs] = 0.0
+                        v[fixed_dofs] = 0.0
+                    if args.stop_vel > 0:
+                        v_world = v.reshape(-1, 3) / unit_scale
+                        max_speed = float(np.linalg.norm(v_world, axis=1).max())
+                        if max_speed < args.stop_vel:
+                            stop_count += 1
+                        else:
+                            stop_count = 0
+                        if stop_count >= max(1, args.stop_steps):
+                            print(f"Stopping early at step {step} (max speed {max_speed:.6f}).")
+                            break
+                    publish(u, step)
+
+            publish(u, args.steps, force=True)
+            end_points = nodes + (u.reshape(-1, 3) / unit_scale) * args.scale
+            end_stats = axis_stats(end_points, report_axis)
+            with lock:
+                shared["points"] = end_points
+                shared["dirty"] = True
+                shared["end_stats"] = end_stats
+                shared["done"] = True
+        except Exception as exc:
+            with lock:
+                shared["error"] = str(exc)
+                shared["traceback"] = traceback.format_exc()
+                shared["done"] = True
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    last_time = time.time()
+    while thread.is_alive():
+        points = None
+        with lock:
+            if shared["dirty"]:
+                points = np.asarray(shared["points"])
+                shared["dirty"] = False
+            err = shared["error"]
+            tb = shared["traceback"]
+        if err:
+            stop_event.set()
+            thread.join(timeout=1.0)
+            raise RuntimeError(f"{err}\n{tb}")
+        if points is not None:
+            grid.points = points
+            plotter.update_coordinates(grid.points, mesh=grid, render=False)
+        try:
+            plotter.update()
+        except Exception:
+            stop_event.set()
+            break
+        if args.fps > 0:
+            now = time.time()
+            delay = max(0.0, (1.0 / float(args.fps)) - (now - last_time))
+            if delay > 0:
+                time.sleep(delay)
+            last_time = time.time()
+        else:
+            time.sleep(0.02)
+
+    stop_event.set()
+    thread.join(timeout=1.0)
+
+    with lock:
+        points = np.asarray(shared["points"])
+        end_stats = shared["end_stats"]
+        err = shared["error"]
+        tb = shared["traceback"]
+    if err:
+        raise RuntimeError(f"{err}\n{tb}")
+    if end_stats is None:
+        end_stats = axis_stats(points, report_axis)
+    grid.points = points
+    plotter.update_coordinates(grid.points, mesh=grid, render=False)
+    return points, end_stats
+
+
 def main():
     parser = argparse.ArgumentParser(description="Preview a linear FEM deformation.")
     parser.add_argument("--stl", help="Path to outer surface STL.")
@@ -636,6 +905,13 @@ def main():
     parser.add_argument("--fix-axis", default="x", choices=["x", "y", "z"])
     parser.add_argument("--fix-frac", type=float, default=0.02)
     parser.add_argument("--fix-side", default="min", choices=["min", "max"], help="Clamp min or max side.")
+    parser.add_argument("--fix-label", action="append", type=int, default=None, help="Fix all nodes belonging to these tet labels (repeatable).")
+    parser.add_argument(
+        "--fix-label-mode",
+        default="replace",
+        choices=["replace", "union"],
+        help="Use label-based fixation alone or union it with geometric fixation.",
+    )
     parser.add_argument("--fix-mode", default="slab", choices=["slab", "plane"], help="Clamp slab or single plane.")
     parser.add_argument("--fix-plane-tol", type=float, default=None, help="Tolerance for plane clamp.")
     parser.add_argument("--fix-plane-offset", type=float, default=0.0, help="Offset plane inward (world units).")
@@ -660,6 +936,18 @@ def main():
         default="max",
         choices=["min", "max"],
         help="Place camera on the min or max Y side of the mesh.",
+    )
+    parser.add_argument(
+        "--fixed-points-mode",
+        default="auto",
+        choices=["auto", "off", "points", "spheres"],
+        help="How to render fixed nodes in interactive preview.",
+    )
+    parser.add_argument(
+        "--max-fixed-points-render",
+        type=int,
+        default=5000,
+        help="Max fixed nodes to draw in preview (0 disables the cap).",
     )
     parser.add_argument("--quasi-static", action="store_true", help="Solve static K u = f each frame.")
     parser.add_argument("--implicit", action="store_true", help="Use implicit (backward Euler) dynamics.")
@@ -762,7 +1050,7 @@ def main():
     else:
         K, masses = assemble_linear_fem(nodes_phys, tets, args.E, args.nu, args.rho)
     f = build_gravity_forces(masses, args.gravity_axis) * float(args.gravity_scale)
-    fixed_dofs = select_fixed_dofs(
+    fixed_nodes_geom = select_fixed_nodes_geometry(
         nodes,
         args.fix_axis,
         args.fix_frac,
@@ -774,6 +1062,29 @@ def main():
         args.fix_plane_tol,
         args.fix_plane_offset,
     )
+    fixed_nodes_label = np.zeros(0, dtype=int)
+    if args.fix_label:
+        fixed_nodes_label = select_fixed_nodes_labels(tets, labels, args.fix_label)
+        if len(fixed_nodes_label) == 0:
+            print(f"Warning: no nodes found for fix labels {args.fix_label}.")
+    if args.fix_label and args.fix_label_mode == "replace":
+        fixed_nodes = fixed_nodes_label
+    elif args.fix_label and args.fix_label_mode == "union":
+        fixed_nodes = np.unique(np.concatenate([fixed_nodes_geom, fixed_nodes_label]))
+    else:
+        fixed_nodes = fixed_nodes_geom
+    if len(fixed_nodes) == 0:
+        print("No fixed nodes selected.")
+        return 1
+    fixed_dofs = fixed_nodes_to_dofs(fixed_nodes)
+    fixed_frac = len(fixed_nodes) / max(1, nodes.shape[0])
+    print(f"Fixed nodes: {len(fixed_nodes)} / {nodes.shape[0]} ({fixed_frac:.3%})")
+    if len(fixed_nodes_label) > 0:
+        label_frac = len(fixed_nodes_label) / max(1, nodes.shape[0])
+        print(f"Label-fixed nodes: {len(fixed_nodes_label)} / {nodes.shape[0]} ({label_frac:.3%})")
+    fixed_bounds_min = nodes[fixed_nodes].min(axis=0)
+    fixed_bounds_max = nodes[fixed_nodes].max(axis=0)
+    print(f"Fixed bounds min={fixed_bounds_min.tolist()} max={fixed_bounds_max.tolist()}")
     report_axis = args.report_axis or axis_from_gravity(args.gravity_axis)
     start_stats = axis_stats(nodes, report_axis)
     print(f"Start {report_axis}-stats: {start_stats}")
@@ -782,181 +1093,216 @@ def main():
         ndof = nodes.shape[0] * 3
         if args.record_dir:
             os.makedirs(args.record_dir, exist_ok=True)
-        plotter = setup_plotter(args.show, surface, grid, args.record_dir, args.camera_y_side)
+        interactive_state = {"paused": False}
+        plotter = setup_plotter(
+            args.show,
+            surface,
+            grid,
+            args.record_dir,
+            args.camera_y_side,
+            nodes[fixed_nodes],
+            args.fixed_points_mode,
+            args.max_fixed_points_render,
+            interactive_state,
+        )
 
-        last_time = time.time()
-        if args.quasi_static:
-            solver, free = make_static_solver(K, fixed_dofs)
-            u = np.zeros(ndof, dtype=float)
-            prev_u = None
-            stop_count = 0
-            frame_idx = 0
-            for step in range(args.steps):
-                if args.gravity_ramp and args.gravity_ramp > 0:
-                    ramp = min(1.0, (step + 1) / float(args.gravity_ramp))
-                else:
-                    ramp = 1.0
-                f_step = f * ramp
-                u[:] = 0.0
-                u[free] = solver(f_step[free])
-                if args.stop_vel > 0:
-                    if prev_u is None:
-                        prev_u = u.copy()
-                    du = (u - prev_u).reshape(-1, 3) / unit_scale
-                    max_step = float(np.linalg.norm(du, axis=1).max())
-                    if max_step < args.stop_vel:
-                        stop_count += 1
-                    else:
-                        stop_count = 0
-                    prev_u = u.copy()
-                    if stop_count >= max(1, args.stop_steps):
-                        print(f"Stopping early at step {step} (max step {max_step:.6f}).")
-                        break
-
-                if plotter is not None:
-                    u_world = u.reshape(-1, 3) / unit_scale
-                    grid.points = nodes + u_world * args.scale
-                    plotter.update_coordinates(grid.points, mesh=grid, render=False)
-                    if args.show:
-                        plotter.update()
-                    if args.record_dir and (step % max(1, args.record_every) == 0):
-                        record_frame(plotter, args.record_dir, args.record_prefix, frame_idx, args.record_format)
-                        frame_idx += 1
-                    if args.fps > 0:
-                        now = time.time()
-                        delay = max(0.0, (1.0 / args.fps) - (now - last_time))
-                        if delay > 0:
-                            time.sleep(delay)
-                        last_time = time.time()
-        elif args.implicit:
-            u = np.zeros(ndof, dtype=float)
-            v = np.zeros(ndof, dtype=float)
-            m_dof = np.repeat(masses, 3)
-            m_dof[m_dof == 0] = 1.0
-            dt = float(args.dt)
-            record_every = args.record_every
-            if args.record_real_time:
-                record_every = max(1, int(round(1.0 / (max(1e-8, dt) * float(args.record_fps)))))
-            stop_count = 0
-            # Rayleigh damping: C = alpha*M + beta*K
-            alpha = float(args.damping)
-            beta = float(args.stiffness_damping)
-            c_dof = alpha * m_dof
-            free = np.setdiff1d(np.arange(ndof), fixed_dofs)
-            # Build and factor implicit system once (constant dt and damping)
-            A_diag = m_dof + dt * c_dof
-            K_scaled = (dt * dt + dt * beta) * K
-            A = sp.diags(A_diag, format="csc") + K_scaled
-            A_ff = A[free, :][:, free]
-            solver = spla.factorized(A_ff)
-            frame_idx = 0
-
-            for step in range(args.steps):
-                if args.gravity_ramp and args.gravity_ramp > 0:
-                    ramp = min(1.0, (step + 1) / float(args.gravity_ramp))
-                else:
-                    ramp = 1.0
-                f_step = f * ramp
-
-                rhs = m_dof * v + dt * (f_step - K @ u)
-                v_new = np.zeros_like(v)
-                v_new[free] = solver(rhs[free])
-                v = v_new
-                u += dt * v
-                u[fixed_dofs] = 0.0
-                v[fixed_dofs] = 0.0
-                if args.stop_vel > 0:
-                    v_world = v.reshape(-1, 3) / unit_scale
-                    max_speed = float(np.linalg.norm(v_world, axis=1).max())
-                    if max_speed < args.stop_vel:
-                        stop_count += 1
-                    else:
-                        stop_count = 0
-                    if stop_count >= max(1, args.stop_steps):
-                        print(f"Stopping early at step {step} (max speed {max_speed:.6f}).")
-                        break
-
-                if plotter is not None:
-                    u_world = u.reshape(-1, 3) / unit_scale
-                    grid.points = nodes + u_world * args.scale
-                    plotter.update_coordinates(grid.points, mesh=grid, render=False)
-                    if args.show:
-                        plotter.update()
-                    if args.record_dir and (step % max(1, record_every) == 0):
-                        record_frame(plotter, args.record_dir, args.record_prefix, frame_idx, args.record_format)
-                        frame_idx += 1
-                    if args.fps > 0:
-                        now = time.time()
-                        delay = max(0.0, (1.0 / args.fps) - (now - last_time))
-                        if delay > 0:
-                            time.sleep(delay)
-                        last_time = time.time()
+        use_async_interactive = bool(args.show) and not args.record_dir
+        if use_async_interactive:
+            deformed, end_stats = run_dynamic_interactive_async(
+                plotter,
+                grid,
+                nodes,
+                K,
+                f,
+                fixed_dofs,
+                masses,
+                args,
+                unit_scale,
+                report_axis,
+                interactive_state,
+            )
         else:
-            u = np.zeros(ndof, dtype=float)
-            v = np.zeros(ndof, dtype=float)
-            m_dof = np.repeat(masses, 3)
-            m_dof[m_dof == 0] = 1.0
-            dt = float(args.dt)
-            substeps = max(1, int(args.substeps))
-            max_disp = float(args.max_disp) * unit_scale
-            record_every = args.record_every
-            if args.record_real_time:
-                record_every = max(1, int(round(1.0 / (max(1e-8, dt) * float(args.record_fps)))))
-            frame_idx = 0
-            stop_count = 0
-            for step in range(args.steps):
-                if args.gravity_ramp and args.gravity_ramp > 0:
-                    ramp = min(1.0, (step + 1) / float(args.gravity_ramp))
-                else:
-                    ramp = 1.0
-                f_step = f * ramp
+            last_time = time.time()
+            if args.quasi_static:
+                solver, free = make_static_solver(K, fixed_dofs)
+                u = np.zeros(ndof, dtype=float)
+                prev_u = None
+                stop_count = 0
+                frame_idx = 0
+                for step in range(args.steps):
+                    while args.show and plotter is not None and interactive_state.get("paused", False):
+                        plotter.update()
+                        time.sleep(0.03)
+                    if args.gravity_ramp and args.gravity_ramp > 0:
+                        ramp = min(1.0, (step + 1) / float(args.gravity_ramp))
+                    else:
+                        ramp = 1.0
+                    f_step = f * ramp
+                    u[:] = 0.0
+                    u[free] = solver(f_step[free])
+                    if args.stop_vel > 0:
+                        if prev_u is None:
+                            prev_u = u.copy()
+                        du = (u - prev_u).reshape(-1, 3) / unit_scale
+                        max_step = float(np.linalg.norm(du, axis=1).max())
+                        if max_step < args.stop_vel:
+                            stop_count += 1
+                        else:
+                            stop_count = 0
+                        prev_u = u.copy()
+                        if stop_count >= max(1, args.stop_steps):
+                            print(f"Stopping early at step {step} (max step {max_step:.6f}).")
+                            break
 
-                for _ in range(substeps):
-                    Ku = K @ u
-                    a = (f_step - Ku - args.damping * v) / m_dof
-                    v += dt * a
-                    if max_disp > 0:
-                        v3 = v.reshape(-1, 3)
-                        speed = np.linalg.norm(v3, axis=1)
-                        max_vel = max_disp / max(dt, 1e-8)
-                        scale = np.minimum(1.0, max_vel / (speed + 1e-12))
-                        v3 *= scale[:, None]
-                        v = v3.reshape(-1)
+                    if plotter is not None:
+                        u_world = u.reshape(-1, 3) / unit_scale
+                        grid.points = nodes + u_world * args.scale
+                        plotter.update_coordinates(grid.points, mesh=grid, render=False)
+                        if args.show:
+                            plotter.update()
+                        if args.record_dir and (step % max(1, args.record_every) == 0):
+                            record_frame(plotter, args.record_dir, args.record_prefix, frame_idx, args.record_format)
+                            frame_idx += 1
+                        if args.fps > 0:
+                            now = time.time()
+                            delay = max(0.0, (1.0 / args.fps) - (now - last_time))
+                            if delay > 0:
+                                time.sleep(delay)
+                            last_time = time.time()
+            elif args.implicit:
+                u = np.zeros(ndof, dtype=float)
+                v = np.zeros(ndof, dtype=float)
+                m_dof = np.repeat(masses, 3)
+                m_dof[m_dof == 0] = 1.0
+                dt = float(args.dt)
+                record_every = args.record_every
+                if args.record_real_time:
+                    record_every = max(1, int(round(1.0 / (max(1e-8, dt) * float(args.record_fps)))))
+                stop_count = 0
+                alpha = float(args.damping)
+                beta = float(args.stiffness_damping)
+                c_dof = alpha * m_dof
+                free = np.setdiff1d(np.arange(ndof), fixed_dofs)
+                A_diag = m_dof + dt * c_dof
+                K_scaled = (dt * dt + dt * beta) * K
+                A = sp.diags(A_diag, format="csc") + K_scaled
+                A_ff = A[free, :][:, free]
+                solver = spla.factorized(A_ff)
+                frame_idx = 0
+
+                for step in range(args.steps):
+                    while args.show and plotter is not None and interactive_state.get("paused", False):
+                        plotter.update()
+                        time.sleep(0.03)
+                    if args.gravity_ramp and args.gravity_ramp > 0:
+                        ramp = min(1.0, (step + 1) / float(args.gravity_ramp))
+                    else:
+                        ramp = 1.0
+                    f_step = f * ramp
+
+                    rhs = m_dof * v + dt * (f_step - K @ u)
+                    v_new = np.zeros_like(v)
+                    v_new[free] = solver(rhs[free])
+                    v = v_new
                     u += dt * v
                     u[fixed_dofs] = 0.0
                     v[fixed_dofs] = 0.0
-                if args.stop_vel > 0:
-                    v_world = v.reshape(-1, 3) / unit_scale
-                    max_speed = float(np.linalg.norm(v_world, axis=1).max())
-                    if max_speed < args.stop_vel:
-                        stop_count += 1
-                    else:
-                        stop_count = 0
-                    if stop_count >= max(1, args.stop_steps):
-                        print(f"Stopping early at step {step} (max speed {max_speed:.6f}).")
-                        break
+                    if args.stop_vel > 0:
+                        v_world = v.reshape(-1, 3) / unit_scale
+                        max_speed = float(np.linalg.norm(v_world, axis=1).max())
+                        if max_speed < args.stop_vel:
+                            stop_count += 1
+                        else:
+                            stop_count = 0
+                        if stop_count >= max(1, args.stop_steps):
+                            print(f"Stopping early at step {step} (max speed {max_speed:.6f}).")
+                            break
 
-                if plotter is not None:
-                    u_world = u.reshape(-1, 3) / unit_scale
-                    grid.points = nodes + u_world * args.scale
-                    plotter.update_coordinates(grid.points, mesh=grid, render=False)
-                    if args.show:
+                    if plotter is not None:
+                        u_world = u.reshape(-1, 3) / unit_scale
+                        grid.points = nodes + u_world * args.scale
+                        plotter.update_coordinates(grid.points, mesh=grid, render=False)
+                        if args.show:
+                            plotter.update()
+                        if args.record_dir and (step % max(1, record_every) == 0):
+                            record_frame(plotter, args.record_dir, args.record_prefix, frame_idx, args.record_format)
+                            frame_idx += 1
+                        if args.fps > 0:
+                            now = time.time()
+                            delay = max(0.0, (1.0 / args.fps) - (now - last_time))
+                            if delay > 0:
+                                time.sleep(delay)
+                            last_time = time.time()
+            else:
+                u = np.zeros(ndof, dtype=float)
+                v = np.zeros(ndof, dtype=float)
+                m_dof = np.repeat(masses, 3)
+                m_dof[m_dof == 0] = 1.0
+                dt = float(args.dt)
+                substeps = max(1, int(args.substeps))
+                max_disp = float(args.max_disp) * unit_scale
+                record_every = args.record_every
+                if args.record_real_time:
+                    record_every = max(1, int(round(1.0 / (max(1e-8, dt) * float(args.record_fps)))))
+                frame_idx = 0
+                stop_count = 0
+                for step in range(args.steps):
+                    while args.show and plotter is not None and interactive_state.get("paused", False):
                         plotter.update()
-                    if args.record_dir and (step % max(1, record_every) == 0):
-                        record_frame(plotter, args.record_dir, args.record_prefix, frame_idx, args.record_format)
-                        frame_idx += 1
-                    if args.fps > 0:
-                        now = time.time()
-                        delay = max(0.0, (1.0 / args.fps) - (now - last_time))
-                        if delay > 0:
-                            time.sleep(delay)
-                        last_time = time.time()
+                        time.sleep(0.03)
+                    if args.gravity_ramp and args.gravity_ramp > 0:
+                        ramp = min(1.0, (step + 1) / float(args.gravity_ramp))
+                    else:
+                        ramp = 1.0
+                    f_step = f * ramp
 
-        u_world = u.reshape(-1, 3) / unit_scale
-        deformed = nodes + u_world * args.scale
-        grid.points = deformed
+                    for _ in range(substeps):
+                        Ku = K @ u
+                        a = (f_step - Ku - args.damping * v) / m_dof
+                        v += dt * a
+                        if max_disp > 0:
+                            v3 = v.reshape(-1, 3)
+                            speed = np.linalg.norm(v3, axis=1)
+                            max_vel = max_disp / max(dt, 1e-8)
+                            scale = np.minimum(1.0, max_vel / (speed + 1e-12))
+                            v3 *= scale[:, None]
+                            v = v3.reshape(-1)
+                        u += dt * v
+                        u[fixed_dofs] = 0.0
+                        v[fixed_dofs] = 0.0
+                    if args.stop_vel > 0:
+                        v_world = v.reshape(-1, 3) / unit_scale
+                        max_speed = float(np.linalg.norm(v_world, axis=1).max())
+                        if max_speed < args.stop_vel:
+                            stop_count += 1
+                        else:
+                            stop_count = 0
+                        if stop_count >= max(1, args.stop_steps):
+                            print(f"Stopping early at step {step} (max speed {max_speed:.6f}).")
+                            break
+
+                    if plotter is not None:
+                        u_world = u.reshape(-1, 3) / unit_scale
+                        grid.points = nodes + u_world * args.scale
+                        plotter.update_coordinates(grid.points, mesh=grid, render=False)
+                        if args.show:
+                            plotter.update()
+                        if args.record_dir and (step % max(1, record_every) == 0):
+                            record_frame(plotter, args.record_dir, args.record_prefix, frame_idx, args.record_format)
+                            frame_idx += 1
+                        if args.fps > 0:
+                            now = time.time()
+                            delay = max(0.0, (1.0 / args.fps) - (now - last_time))
+                            if delay > 0:
+                                time.sleep(delay)
+                            last_time = time.time()
+
+            u_world = u.reshape(-1, 3) / unit_scale
+            deformed = nodes + u_world * args.scale
+            grid.points = deformed
+            end_stats = axis_stats(deformed, report_axis)
+
         surface_def = grid.extract_surface().triangulate()
-        end_stats = axis_stats(deformed, report_axis)
         print(f"End {report_axis}-stats: {end_stats}")
         print(f"Delta {report_axis}-mean: {end_stats['mean'] - start_stats['mean']:.3f}")
         surface_def.save(args.out)
