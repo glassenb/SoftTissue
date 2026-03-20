@@ -1,0 +1,54 @@
+{
+  "pitch": 4.0,
+  "resolve": "overwrite",
+  "threshold": 0.0,
+  "out": "../../Data/SA_SEGMENTATION/normalized/sa_mri_volume_p4.npz",
+  "meta": "../../Data/SA_SEGMENTATION/normalized/sa_mri_volume_p4.json",
+  "masks": [
+    {
+      "path": "../../Data/SA_SEGMENTATION/SA_segmentation/MRI_SA/REMAINER.nii",
+      "label": 2,
+      "name": "mri_remainder_fill"
+    },
+    {
+      "path": "../../Data/SA_SEGMENTATION/SA_segmentation/MRI_SA/FAT.nii",
+      "label": 2,
+      "name": "mri_fat"
+    },
+    {
+      "path": "../../Data/SA_SEGMENTATION/SA_segmentation/MRI_SA/BREAST TISSUE LT.nii",
+      "label": 3,
+      "name": "mri_breast_tissue_left"
+    },
+    {
+      "path": "../../Data/SA_SEGMENTATION/SA_segmentation/MRI_SA/BREAST TISSUE RT.nii",
+      "label": 3,
+      "name": "mri_breast_tissue_right"
+    },
+    {
+      "path": "../../Data/SA_SEGMENTATION/SA_segmentation/MRI_SA/MASS.nii",
+      "label": 5,
+      "name": "mri_mass"
+    },
+    {
+      "path": "../../Data/SA_SEGMENTATION/SA_segmentation/MRI_SA/MUSCLE.nii",
+      "label": 6,
+      "name": "mri_muscle"
+    },
+    {
+      "path": "../../Data/SA_SEGMENTATION/SA_segmentation/MRI_SA/NIPPLE LT.nii",
+      "label": 7,
+      "name": "mri_nipple_left"
+    },
+    {
+      "path": "../../Data/SA_SEGMENTATION/SA_segmentation/MRI_SA/NIPPLE RT.nii",
+      "label": 7,
+      "name": "mri_nipple_right"
+    },
+    {
+      "path": "../../Data/SA_SEGMENTATION/SA_segmentation/MRI_SA/SKIN OUTER.nii",
+      "label": 1,
+      "name": "mri_skin_outer"
+    }
+  ]
+}

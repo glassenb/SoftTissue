@@ -1,0 +1,95 @@
+{
+  // SA MRI p6 reduced interactive debug view.
+  // This mesh removes all muscle tets plus any tet fully posterior to the back face of muscle.
+  // Fixation comes from the saved interface node list, not from labels or a slab.
+
+  // Input paths
+  "config": null,
+  "stl": null,
+  "tet": "C:/dev/softtissue/Data/SA_SEGMENTATION/normalized/sa_mri_tet_p6_pruned_muscle_back.vtk",
+  "tet_npz": null,
+  "materials": "C:/dev/softtissue/materials.json",
+
+  // Output paths
+  "out": "C:/dev/softtissue/outputs/previews/sa_mri_p6_pruned_muscle_back_preview.vtk",
+  "screenshot": null,
+
+  // Mesh / tet generation (unused for tet input)
+  "max_volume": null,
+  "decimate": 0.0,
+  "no_meshfix": false,
+  "keep_all": false,
+  "min_comp_ratio": 0.0,
+  "keep_largest_component": false,
+
+  // Material defaults
+  "E": 20000.0,
+  "nu": 0.45,
+  "rho": 1000.0,
+  "default_E": 20000.0,
+  "default_nu": 0.45,
+  "default_rho": 1000.0,
+
+  // Boundary conditions
+  "fix_axis": "y", // unused because fix_nodes_file_mode=replace
+  "fix_side": "min", // unused because fix_nodes_file_mode=replace
+  "fix_frac": 0.02, // unused because fix_nodes_file_mode=replace
+  "fix_mode": "slab", // options: slab|plane
+  "fix_plane_tol": null,
+  "fix_plane_offset": 0.0,
+  "fix_extend_axis": null,
+  "fix_extend_side": "min",
+  "fix_extend_frac": 0.0,
+  "fix_label": [],
+  "fix_label_mode": "replace", // options: replace|union
+  "fix_nodes_file": "C:/dev/softtissue/Data/SA_SEGMENTATION/normalized/sa_mri_tet_p6_pruned_muscle_back_fixed_nodes.npz",
+  "fix_nodes_file_mode": "replace", // options: replace|union
+
+  // Forces and units
+  "gravity_axis": "-z", // options: -x|+x|-y|+y|-z|+z
+  "gravity_scale": 1.0,
+  "unit_scale": 0.001,
+  "scale": 1.0,
+
+  // Simulation mode
+  "steps": 30000,
+  "dt": 0.001,
+  "damping": 0.4,
+  "stiffness_damping": 0.05,
+  "substeps": 1,
+  "max_disp": 0.0,
+  "quasi_static": false,
+  "implicit": true,
+
+  // Runtime / display
+  "fps": 30.0,
+  "show": true,
+  "report_axis": null, // options: x|y|z|null
+  "camera_y_side": "max", // options: min|max
+  "fixed_points_mode": "off", // options: auto|off|points|spheres
+  "max_fixed_points_render": 2000,
+  "display_mode": "separate", // options: full|separate
+  "hide_label": [], // example: [2] hides the bulk fill
+  "label_opacity": [
+    "1=0.05", // skin outer
+    "2=0.08", // fat / remainder fill
+    "3=0.55", // gland / breast tissue
+    "5=0.98", // tumor
+    "7=0.75"  // nipple
+  ],
+  "surface_opacity": 0.03,
+  "tissue_opacity": 0.8,
+
+  // Recording
+  "record_dir": null,
+  "record_every": 1,
+  "record_prefix": "frame",
+  "record_format": "png", // options: png|jpg
+  "record_video": null,
+  "record_fps": 30,
+  "record_real_time": false,
+
+  // Auto-stop
+  "stop_vel": 0.5,
+  "stop_steps": 60
+}

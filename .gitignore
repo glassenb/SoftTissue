@@ -14,3 +14,4 @@ frames/
 videos/frames_*/
 videos/*.json
 videos/*.md
+outputs/

@@ -1,0 +1,84 @@
+{
+  // SA MRI p6 reduced debug recording with much softer tissue settings.
+  // Uses the pruned mesh plus explicit fixed interface nodes.
+
+  "config": null,
+  "stl": null,
+  "tet": "C:/dev/softtissue/Data/SA_SEGMENTATION/normalized/sa_mri_tet_p6_pruned_muscle_back.vtk",
+  "tet_npz": null,
+  "materials": "C:/dev/softtissue/configs/materials_sa_mri_pruned_debug_softer.json",
+
+  "out": "C:/dev/softtissue/outputs/previews/sa_mri_p6_pruned_muscle_back_softer_preview_20260319_221328.vtk",
+  "screenshot": null,
+
+  "max_volume": null,
+  "decimate": 0.0,
+  "no_meshfix": false,
+  "keep_all": false,
+  "min_comp_ratio": 0.0,
+  "keep_largest_component": false,
+
+  "E": 20000.0,
+  "nu": 0.45,
+  "rho": 1000.0,
+  "default_E": 20000.0,
+  "default_nu": 0.45,
+  "default_rho": 1000.0,
+
+  "fix_axis": "y",
+  "fix_side": "min",
+  "fix_frac": 0.02,
+  "fix_mode": "slab",
+  "fix_plane_tol": null,
+  "fix_plane_offset": 0.0,
+  "fix_extend_axis": null,
+  "fix_extend_side": "min",
+  "fix_extend_frac": 0.0,
+  "fix_label": [],
+  "fix_label_mode": "replace",
+  "fix_nodes_file": "C:/dev/softtissue/Data/SA_SEGMENTATION/normalized/sa_mri_tet_p6_pruned_muscle_back_fixed_nodes.npz",
+  "fix_nodes_file_mode": "replace",
+
+  "gravity_axis": "-z",
+  "gravity_scale": 1.0,
+  "unit_scale": 0.001,
+  "scale": 1.0,
+
+  "steps": 30000,
+  "dt": 0.001,
+  "damping": 0.4,
+  "stiffness_damping": 0.05,
+  "substeps": 1,
+  "max_disp": 0.0,
+  "quasi_static": false,
+  "implicit": true,
+
+  "fps": 30.0,
+  "show": false,
+  "report_axis": null,
+  "camera_y_side": "max",
+  "fixed_points_mode": "off",
+  "max_fixed_points_render": 2000,
+  "display_mode": "separate",
+  "hide_label": [],
+  "label_opacity": [
+    "1=0.05",
+    "2=0.08",
+    "3=0.55",
+    "5=0.98",
+    "7=0.75"
+  ],
+  "surface_opacity": 0.03,
+  "tissue_opacity": 0.8,
+
+  "record_dir": "C:/dev/softtissue/videos/frames_20260319_221328_sa_mri_p6_pruned_muscle_back_softer",
+  "record_every": 1,
+  "record_prefix": "frame",
+  "record_format": "png",
+  "record_video": "C:/dev/softtissue/videos/sim_20260319_221328_sa_mri_p6_pruned_muscle_back_softer.mp4",
+  "record_fps": 30,
+  "record_real_time": true,
+
+  "stop_vel": 0.5,
+  "stop_steps": 1200
+}

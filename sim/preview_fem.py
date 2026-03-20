@@ -319,6 +319,44 @@ def axis_from_gravity(gravity_axis):
     return axis if axis in {"x", "y", "z"} else "z"
 
 
+def label_colors():
+    return {
+        0: "#e0e0e0",  # background
+        1: "#ff6f91",  # skin
+        2: "#ffd166",  # fat / remainder
+        3: "#8ac926",  # gland
+        4: "#4ea8de",  # implant
+        5: "#1a0a0a",  # tumor
+        6: "#7a6ff0",  # muscle
+        7: "#fff2b2",  # nipple
+        8: "#4b3f2f",  # anchor / bone proxy
+    }
+
+
+def parse_label_opacity_specs(specs):
+    out = {}
+    for spec in specs or []:
+        if "=" not in str(spec):
+            raise ValueError(f"Invalid --label-opacity spec '{spec}'. Use LABEL=OPACITY.")
+        key, value = str(spec).split("=", 1)
+        out[int(key.strip())] = float(value.strip())
+    return out
+
+
+def update_dynamic_meshes(plotter, grid_points):
+    if plotter is None:
+        return
+    targets = getattr(plotter, "_dynamic_meshes", None)
+    if not targets:
+        return
+    for target in targets:
+        mesh = target["mesh"]
+        orig_ids = target.get("orig_ids")
+        pts = grid_points if orig_ids is None else grid_points[orig_ids]
+        mesh.points = pts
+        plotter.update_coordinates(mesh.points, mesh=mesh, render=False)
+
+
 def setup_plotter(
     show,
     surface,
@@ -329,41 +367,58 @@ def setup_plotter(
     fixed_points_mode="auto",
     max_fixed_points_render=5000,
     interactive_state=None,
+    display_mode="full",
+    hide_labels=None,
+    label_opacity_specs=None,
+    surface_opacity=0.1,
+    tissue_opacity=0.8,
 ):
     if not show and not record_dir:
         return None
     offscreen = bool(record_dir) and not show
     plotter = pv.Plotter(off_screen=offscreen)
-    plotter.add_mesh(surface, color="lightgray", opacity=0.1)
+    plotter.add_mesh(surface, color="lightgray", opacity=surface_opacity)
+    plotter._dynamic_meshes = []
     if "label" in grid.cell_data:
-        # Categorical tissue colors
-        cmap = [
-            "#e0e0e0",  # 0 background
-            "#ff6f91",  # 1 skin (pink)
-            "#ffd166",  # 2 fat (warm yellow)
-            "#8ac926",  # 3 gland (green)
-            "#4ea8de",  # 4 implant (blue)
-            "#1a0a0a",  # 5 tumor (very dark)
-            "#7a6ff0",  # 6 muscle (indigo)
-            "#fff2b2",  # 7 nipple (pale yellow)
-            "#4b3f2f",  # 8 anchor / bone proxy (dark brown)
-        ]
-        plotter.add_mesh(
-            grid,
-            scalars="label",
-            categories=True,
-            cmap=cmap,
-            opacity=0.8,
-            show_edges=False,
-        )
-        # Tumor overlay for visibility
-        try:
-            tumor = grid.threshold([4.5, 5.5], scalars="label")
-            plotter.add_mesh(tumor, color="#1a0a0a", opacity=0.9, show_edges=False)
-        except Exception:
-            pass
+        hide_labels = set(int(v) for v in (hide_labels or []))
+        opacity_map = parse_label_opacity_specs(label_opacity_specs)
+        colors = label_colors()
+        labels = np.asarray(grid.cell_data["label"]).astype(int)
+        if display_mode == "separate":
+            for label in sorted(v for v in np.unique(labels).tolist() if v > 0 and v not in hide_labels):
+                cell_ids = np.where(labels == label)[0]
+                if len(cell_ids) == 0:
+                    continue
+                sub = grid.extract_cells(cell_ids)
+                orig_ids = None
+                if "vtkOriginalPointIds" in sub.point_data:
+                    orig_ids = np.asarray(sub.point_data["vtkOriginalPointIds"]).astype(int)
+                plotter.add_mesh(
+                    sub,
+                    color=colors.get(label, "#cccccc"),
+                    opacity=float(opacity_map.get(label, tissue_opacity)),
+                    show_edges=False,
+                )
+                plotter._dynamic_meshes.append({"mesh": sub, "orig_ids": orig_ids})
+        else:
+            display_grid = grid.copy()
+            display_labels = labels.copy()
+            if hide_labels:
+                display_labels[np.isin(display_labels, np.asarray(sorted(hide_labels), dtype=int))] = 0
+            display_grid.cell_data["label"] = display_labels
+            cmap = [colors.get(i, "#cccccc") for i in range(max(colors.keys()) + 1)]
+            plotter.add_mesh(
+                display_grid,
+                scalars="label",
+                categories=True,
+                cmap=cmap,
+                opacity=tissue_opacity,
+                show_edges=False,
+            )
+            plotter._dynamic_meshes.append({"mesh": display_grid, "orig_ids": None})
     else:
         plotter.add_mesh(grid, color="tomato", opacity=0.6, show_edges=False)
+        plotter._dynamic_meshes.append({"mesh": grid, "orig_ids": None})
     if fixed_points is not None and len(fixed_points) > 0:
         pts = fixed_points
         if max_fixed_points_render and len(pts) > max_fixed_points_render:
@@ -405,6 +460,15 @@ def setup_plotter(
             print("Paused interactive playback." if state["paused"] else "Resumed interactive playback.")
 
         plotter.add_key_event("p", toggle_pause)
+        plotter._status_actor = plotter.add_text(
+            "State: initializing",
+            position="upper_left",
+            font_size=10,
+            color="black",
+            shadow=True,
+            name="status_overlay",
+            render=False,
+        )
         plotter.show(auto_close=False, interactive_update=True)
     return plotter
 
@@ -569,6 +633,33 @@ def fixed_nodes_to_dofs(fixed_nodes):
     return fixed_dofs
 
 
+def load_fixed_nodes_file(path, n_nodes):
+    if not path:
+        return np.zeros(0, dtype=int)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Fixed nodes file not found: {path}")
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".npy":
+        fixed_nodes = np.load(path)
+    elif ext == ".npz":
+        data = np.load(path)
+        if "fixed_nodes" in data:
+            fixed_nodes = data["fixed_nodes"]
+        elif "nodes" in data:
+            fixed_nodes = data["nodes"]
+        elif "indices" in data:
+            fixed_nodes = data["indices"]
+        else:
+            raise ValueError(f"NPZ fixed nodes file missing supported key: {path}")
+    else:
+        raise ValueError(f"Unsupported fixed nodes file format: {path}")
+    fixed_nodes = np.asarray(fixed_nodes, dtype=int).reshape(-1)
+    fixed_nodes = np.unique(fixed_nodes)
+    if fixed_nodes.size and (fixed_nodes.min() < 0 or fixed_nodes.max() >= n_nodes):
+        raise ValueError(f"Fixed nodes file contains out-of-range indices: {path}")
+    return fixed_nodes
+
+
 def select_fixed_nodes_geometry(
     nodes,
     fix_axis="x",
@@ -680,9 +771,19 @@ def run_dynamic_interactive_async(plotter, grid, nodes, K, f, fixed_dofs, masses
         "error": None,
         "traceback": None,
         "end_stats": None,
+        "phase": "initializing",
+        "step": 0,
+        "step_total": int(args.steps),
+        "max_speed": None,
     }
     lock = threading.Lock()
     stop_event = threading.Event()
+
+    status_actor = getattr(plotter, "_status_actor", None)
+
+    def set_shared(**kwargs):
+        with lock:
+            shared.update(kwargs)
 
     def publish(u_vec, step, force=False):
         if (not force) and (step % max(1, render_every) != 0):
@@ -696,7 +797,9 @@ def run_dynamic_interactive_async(plotter, grid, nodes, K, f, fixed_dofs, masses
     def worker():
         try:
             if args.quasi_static:
+                set_shared(phase="preparing quasi-static solver", step=0)
                 solver, free = make_static_solver(K, fixed_dofs)
+                set_shared(phase="running", step=0)
                 u = np.zeros(ndof, dtype=float)
                 prev_u = None
                 stop_count = 0
@@ -717,6 +820,7 @@ def run_dynamic_interactive_async(plotter, grid, nodes, K, f, fixed_dofs, masses
                             prev_u = u.copy()
                         du = (u - prev_u).reshape(-1, 3) / unit_scale
                         max_step = float(np.linalg.norm(du, axis=1).max())
+                        set_shared(step=step + 1, max_speed=max_step)
                         if max_step < args.stop_vel:
                             stop_count += 1
                         else:
@@ -725,6 +829,8 @@ def run_dynamic_interactive_async(plotter, grid, nodes, K, f, fixed_dofs, masses
                         if stop_count >= max(1, args.stop_steps):
                             print(f"Stopping early at step {step} (max step {max_step:.6f}).")
                             break
+                    else:
+                        set_shared(step=step + 1)
                     publish(u, step)
             elif args.implicit:
                 u = np.zeros(ndof, dtype=float)
@@ -741,9 +847,11 @@ def run_dynamic_interactive_async(plotter, grid, nodes, K, f, fixed_dofs, masses
                 K_scaled = (dt * dt + dt * beta) * K
                 A = sp.diags(A_diag, format="csc") + K_scaled
                 A_ff = A[free, :][:, free]
+                set_shared(phase="preparing implicit solver", step=0)
                 print("Preparing implicit solver...")
                 solver = spla.factorized(A_ff)
                 print("Implicit solver ready.")
+                set_shared(phase="running", step=0)
 
                 for step in range(args.steps):
                     if stop_event.is_set():
@@ -766,6 +874,7 @@ def run_dynamic_interactive_async(plotter, grid, nodes, K, f, fixed_dofs, masses
                     if args.stop_vel > 0:
                         v_world = v.reshape(-1, 3) / unit_scale
                         max_speed = float(np.linalg.norm(v_world, axis=1).max())
+                        set_shared(step=step + 1, max_speed=max_speed)
                         if max_speed < args.stop_vel:
                             stop_count += 1
                         else:
@@ -773,8 +882,11 @@ def run_dynamic_interactive_async(plotter, grid, nodes, K, f, fixed_dofs, masses
                         if stop_count >= max(1, args.stop_steps):
                             print(f"Stopping early at step {step} (max speed {max_speed:.6f}).")
                             break
+                    else:
+                        set_shared(step=step + 1)
                     publish(u, step)
             else:
+                set_shared(phase="running explicit", step=0)
                 u = np.zeros(ndof, dtype=float)
                 v = np.zeros(ndof, dtype=float)
                 m_dof = np.repeat(masses, 3)
@@ -811,6 +923,7 @@ def run_dynamic_interactive_async(plotter, grid, nodes, K, f, fixed_dofs, masses
                     if args.stop_vel > 0:
                         v_world = v.reshape(-1, 3) / unit_scale
                         max_speed = float(np.linalg.norm(v_world, axis=1).max())
+                        set_shared(step=step + 1, max_speed=max_speed)
                         if max_speed < args.stop_vel:
                             stop_count += 1
                         else:
@@ -818,6 +931,8 @@ def run_dynamic_interactive_async(plotter, grid, nodes, K, f, fixed_dofs, masses
                         if stop_count >= max(1, args.stop_steps):
                             print(f"Stopping early at step {step} (max speed {max_speed:.6f}).")
                             break
+                    else:
+                        set_shared(step=step + 1)
                     publish(u, step)
 
             publish(u, args.steps, force=True)
@@ -827,11 +942,13 @@ def run_dynamic_interactive_async(plotter, grid, nodes, K, f, fixed_dofs, masses
                 shared["points"] = end_points
                 shared["dirty"] = True
                 shared["end_stats"] = end_stats
+                shared["phase"] = "complete"
                 shared["done"] = True
         except Exception as exc:
             with lock:
                 shared["error"] = str(exc)
                 shared["traceback"] = traceback.format_exc()
+                shared["phase"] = "error"
                 shared["done"] = True
 
     thread = threading.Thread(target=worker, daemon=True)
@@ -846,13 +963,31 @@ def run_dynamic_interactive_async(plotter, grid, nodes, K, f, fixed_dofs, masses
                 shared["dirty"] = False
             err = shared["error"]
             tb = shared["traceback"]
+            phase = shared["phase"]
+            step = shared["step"]
+            step_total = shared["step_total"]
+            max_speed = shared["max_speed"]
         if err:
             stop_event.set()
             thread.join(timeout=1.0)
             raise RuntimeError(f"{err}\n{tb}")
         if points is not None:
             grid.points = points
-            plotter.update_coordinates(grid.points, mesh=grid, render=False)
+            update_dynamic_meshes(plotter, grid.points)
+        if status_actor is not None:
+            state_text = "paused" if interactive_state.get("paused", False) else "running"
+            lines = [
+                f"State: {phase} ({state_text})",
+                f"Step: {step}/{step_total}",
+                f"Mode: {'implicit' if args.implicit else 'quasi-static' if args.quasi_static else 'explicit'}",
+                "Keys: p pause/resume, r reset",
+            ]
+            if max_speed is not None:
+                lines.insert(2, f"Max speed: {max_speed:.3f}")
+            try:
+                status_actor.SetText(2, "\n".join(lines))
+            except Exception:
+                pass
         try:
             plotter.update()
         except Exception:
@@ -875,12 +1010,18 @@ def run_dynamic_interactive_async(plotter, grid, nodes, K, f, fixed_dofs, masses
         end_stats = shared["end_stats"]
         err = shared["error"]
         tb = shared["traceback"]
+        phase = shared["phase"]
     if err:
         raise RuntimeError(f"{err}\n{tb}")
     if end_stats is None:
         end_stats = axis_stats(points, report_axis)
     grid.points = points
-    plotter.update_coordinates(grid.points, mesh=grid, render=False)
+    update_dynamic_meshes(plotter, grid.points)
+    if status_actor is not None:
+        try:
+            status_actor.SetText(2, f"State: {phase}\nStep: {shared['step']}/{shared['step_total']}\nKeys: p pause/resume, r reset")
+        except Exception:
+            pass
     return points, end_stats
 
 
@@ -911,6 +1052,13 @@ def main():
         default="replace",
         choices=["replace", "union"],
         help="Use label-based fixation alone or union it with geometric fixation.",
+    )
+    parser.add_argument("--fix-nodes-file", default=None, help="NPY/NPZ file listing node indices to fix.")
+    parser.add_argument(
+        "--fix-nodes-file-mode",
+        default="union",
+        choices=["replace", "union"],
+        help="Use file-based fixation alone or union it with geometric fixation.",
     )
     parser.add_argument("--fix-mode", default="slab", choices=["slab", "plane"], help="Clamp slab or single plane.")
     parser.add_argument("--fix-plane-tol", type=float, default=None, help="Tolerance for plane clamp.")
@@ -949,6 +1097,21 @@ def main():
         default=5000,
         help="Max fixed nodes to draw in preview (0 disables the cap).",
     )
+    parser.add_argument(
+        "--display-mode",
+        default="full",
+        choices=["full", "separate"],
+        help="Render the deformed tet mesh as one actor or one actor per label.",
+    )
+    parser.add_argument("--hide-label", action="append", type=int, default=None, help="Hide these labels in the preview (repeatable).")
+    parser.add_argument(
+        "--label-opacity",
+        action="append",
+        default=None,
+        help="Per-label opacity override as LABEL=OPACITY (repeatable; used with separate display mode).",
+    )
+    parser.add_argument("--surface-opacity", type=float, default=0.1, help="Opacity for the light gray reference surface.")
+    parser.add_argument("--tissue-opacity", type=float, default=0.8, help="Default opacity for tissue rendering.")
     parser.add_argument("--quasi-static", action="store_true", help="Solve static K u = f each frame.")
     parser.add_argument("--implicit", action="store_true", help="Use implicit (backward Euler) dynamics.")
     parser.add_argument("--substeps", type=int, default=1, help="Substeps per frame.")
@@ -1062,17 +1225,26 @@ def main():
         args.fix_plane_tol,
         args.fix_plane_offset,
     )
+    try:
+        fixed_nodes_file = load_fixed_nodes_file(args.fix_nodes_file, nodes.shape[0]) if args.fix_nodes_file else np.zeros(0, dtype=int)
+    except Exception as exc:
+        print(exc)
+        return 1
     fixed_nodes_label = np.zeros(0, dtype=int)
     if args.fix_label:
         fixed_nodes_label = select_fixed_nodes_labels(tets, labels, args.fix_label)
         if len(fixed_nodes_label) == 0:
             print(f"Warning: no nodes found for fix labels {args.fix_label}.")
+    if args.fix_nodes_file and args.fix_nodes_file_mode == "replace":
+        fixed_nodes = fixed_nodes_file
+    else:
+        fixed_nodes = fixed_nodes_geom
+        if len(fixed_nodes_file) > 0:
+            fixed_nodes = np.unique(np.concatenate([fixed_nodes, fixed_nodes_file]))
     if args.fix_label and args.fix_label_mode == "replace":
         fixed_nodes = fixed_nodes_label
     elif args.fix_label and args.fix_label_mode == "union":
-        fixed_nodes = np.unique(np.concatenate([fixed_nodes_geom, fixed_nodes_label]))
-    else:
-        fixed_nodes = fixed_nodes_geom
+        fixed_nodes = np.unique(np.concatenate([fixed_nodes, fixed_nodes_label]))
     if len(fixed_nodes) == 0:
         print("No fixed nodes selected.")
         return 1
@@ -1082,6 +1254,9 @@ def main():
     if len(fixed_nodes_label) > 0:
         label_frac = len(fixed_nodes_label) / max(1, nodes.shape[0])
         print(f"Label-fixed nodes: {len(fixed_nodes_label)} / {nodes.shape[0]} ({label_frac:.3%})")
+    if len(fixed_nodes_file) > 0:
+        file_frac = len(fixed_nodes_file) / max(1, nodes.shape[0])
+        print(f"File-fixed nodes: {len(fixed_nodes_file)} / {nodes.shape[0]} ({file_frac:.3%})")
     fixed_bounds_min = nodes[fixed_nodes].min(axis=0)
     fixed_bounds_max = nodes[fixed_nodes].max(axis=0)
     print(f"Fixed bounds min={fixed_bounds_min.tolist()} max={fixed_bounds_max.tolist()}")
@@ -1104,6 +1279,11 @@ def main():
             args.fixed_points_mode,
             args.max_fixed_points_render,
             interactive_state,
+            args.display_mode,
+            args.hide_label,
+            args.label_opacity,
+            args.surface_opacity,
+            args.tissue_opacity,
         )
 
         use_async_interactive = bool(args.show) and not args.record_dir
@@ -1157,7 +1337,7 @@ def main():
                     if plotter is not None:
                         u_world = u.reshape(-1, 3) / unit_scale
                         grid.points = nodes + u_world * args.scale
-                        plotter.update_coordinates(grid.points, mesh=grid, render=False)
+                        update_dynamic_meshes(plotter, grid.points)
                         if args.show:
                             plotter.update()
                         if args.record_dir and (step % max(1, args.record_every) == 0):
@@ -1221,7 +1401,7 @@ def main():
                     if plotter is not None:
                         u_world = u.reshape(-1, 3) / unit_scale
                         grid.points = nodes + u_world * args.scale
-                        plotter.update_coordinates(grid.points, mesh=grid, render=False)
+                        update_dynamic_meshes(plotter, grid.points)
                         if args.show:
                             plotter.update()
                         if args.record_dir and (step % max(1, record_every) == 0):
@@ -1284,7 +1464,7 @@ def main():
                     if plotter is not None:
                         u_world = u.reshape(-1, 3) / unit_scale
                         grid.points = nodes + u_world * args.scale
-                        plotter.update_coordinates(grid.points, mesh=grid, render=False)
+                        update_dynamic_meshes(plotter, grid.points)
                         if args.show:
                             plotter.update()
                         if args.record_dir and (step % max(1, record_every) == 0):

@@ -2,7 +2,7 @@
   // Input paths
   "config": null,
   "stl": null,
-  "tet": "C:/dev/softtissue/Data/GM_STL/MRI/tet_mesh_gm_mri_p6.vtk",
+  "tet": "C:/dev/softtissue/Data/GM_STL/MRI/tet_mesh_gm_mri_p3.vtk",
   "tet_npz": null,
   "materials": "C:/dev/softtissue/materials.json",
 

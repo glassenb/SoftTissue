@@ -1,49 +1,41 @@
-﻿{
-  // Input paths
+// SA MRI p6 muscle-fixed interior debug video config
+{
   "config": null,
   "stl": null,
-  "tet": "C:/dev/softtissue/Data/GM_STL/MRI/tet_mesh_gm_mri_p6.vtk",
+  "tet": "C:/dev/softtissue/Data/SA_SEGMENTATION/normalized/sa_mri_tet_p6.vtk",
   "tet_npz": null,
   "materials": "C:/dev/softtissue/materials.json",
-
-  // Output paths
-  "out": "C:/dev/softtissue/outputs/previews/preview_deformed.vtk",
+  "out": "C:/dev/softtissue/outputs/previews/sa_mri_p6_debug_preview.vtk",
   "screenshot": null,
-
-  // Mesh / tet generation (only used when --stl is provided)
   "max_volume": null,
   "decimate": 0.0,
   "no_meshfix": false,
   "keep_all": false,
   "min_comp_ratio": 0.0,
   "keep_largest_component": false,
-
-  // Material defaults (used when no materials.json or missing labels)
   "E": 20000.0,
   "nu": 0.45,
   "rho": 1000.0,
   "default_E": 20000.0,
   "default_nu": 0.45,
   "default_rho": 1000.0,
-
-  // Boundary conditions (fixing)
   "fix_axis": "y",
-  "fix_side": "max",
+  "fix_side": "min",
   "fix_frac": 0.3,
   "fix_mode": "slab",
   "fix_plane_tol": null,
   "fix_plane_offset": 0.0,
   "fix_extend_axis": "y",
-  "fix_extend_side": "max",
+  "fix_extend_side": "min",
   "fix_extend_frac": 0.05,
-
-  // Forces and units
+  "fix_label": [
+    6
+  ],
+  "fix_label_mode": "replace",
   "gravity_axis": "-z",
   "gravity_scale": 1.0,
   "unit_scale": 0.001,
   "scale": 1.0,
-
-  // Simulation mode
   "steps": 30000,
   "dt": 0.001,
   "damping": 0.4,
@@ -52,25 +44,31 @@
   "max_disp": 0.0,
   "quasi_static": false,
   "implicit": true,
-
-  // Runtime / display
   "fps": 30.0,
-  "show": true,
-  "report_axis": null, // options: x|y|z|null
-  "camera_y_side": "min", // options: min|max
-  "fixed_points_mode": "off", // options: auto|off|points|spheres
+  "show": false,
+  "report_axis": null,
+  "camera_y_side": "max",
+  "fixed_points_mode": "off",
   "max_fixed_points_render": 2000,
-
-  // Recording
-  "record_dir": null,
+  "display_mode": "separate",
+  "hide_label": [],
+  "label_opacity": [
+    "1=0.05",
+    "2=0.08",
+    "3=0.55",
+    "5=0.98",
+    "6=0.35",
+    "7=0.75"
+  ],
+  "surface_opacity": 0.03,
+  "tissue_opacity": 0.8,
   "record_every": 1,
   "record_prefix": "frame",
   "record_format": "png",
-  "record_video": null,
   "record_fps": 30,
-  "record_real_time": false,
-
-  // Auto-stop
+  "record_real_time": true,
   "stop_vel": 0.5,
-  "stop_steps": 60
+  "stop_steps": 60,
+  "record_dir": "C:/dev/softtissue/videos/frames_20260319_125358_sa_mri_p6_muscle_interior_debug",
+  "record_video": "C:/dev/softtissue/videos/sim_20260319_125358_sa_mri_p6_muscle_interior_debug.mp4"
 }
