@@ -116,13 +116,32 @@ def camera_from_bounds(bounds, y_side: str = "max"):
     return pos, center, np.array([0.0, 0.0, 1.0])
 
 
-def make_plotter(initial_points: np.ndarray, surface_faces: np.ndarray, cfg: dict, plate_render=None):
+def make_plotter(
+    initial_points: np.ndarray,
+    surface_faces: np.ndarray,
+    cfg: dict,
+    plate_render=None,
+    plate_render_start=None,
+):
     current = pv.PolyData(initial_points.copy(), surface_faces)
     initial = pv.PolyData(initial_points.copy(), surface_faces)
     plotter = pv.Plotter(off_screen=True, window_size=tuple(cfg.get("window_size", [1280, 960])))
     plotter.set_background(cfg.get("background", "white"))
     plotter.add_mesh(initial, color=cfg.get("initial_color", "lightgray"), opacity=float(cfg.get("initial_opacity", 0.18)), smooth_shading=False)
     plotter.add_mesh(current, color=cfg.get("current_color", "salmon"), opacity=float(cfg.get("current_opacity", 0.75)), smooth_shading=False)
+    plate_start_poly = None
+    if plate_render_start is not None and cfg.get("plate_show_start_ghost", True):
+        plate_start_poly = pv.PolyData(plate_render_start["points"].copy(), plate_render_start["faces"])
+        plotter.add_mesh(
+            plate_start_poly,
+            color=cfg.get("plate_start_ghost_color", "royalblue"),
+            opacity=float(cfg.get("plate_start_ghost_opacity", 0.22)),
+            smooth_shading=False,
+            style=cfg.get("plate_start_ghost_style", "wireframe"),
+            show_edges=bool(cfg.get("plate_start_ghost_show_edges", True)),
+            edge_color=cfg.get("plate_start_ghost_edge_color", "navy"),
+            line_width=float(cfg.get("plate_start_ghost_line_width", 2.0)),
+        )
     plate_poly = None
     if plate_render is not None:
         plate_poly = pv.PolyData(plate_render["points"].copy(), plate_render["faces"])
@@ -138,7 +157,7 @@ def make_plotter(initial_points: np.ndarray, surface_faces: np.ndarray, cfg: dic
     plotter.show_axes()
     cpos = camera_from_bounds(current.bounds, cfg.get("camera_y_side", "max"))
     plotter.camera_position = cpos
-    return plotter, current, plate_poly
+    return plotter, current, plate_poly, plate_start_poly, cpos
 
 
 def ensure_empty_dir(path: Path):
@@ -169,7 +188,21 @@ def local_asset_path(name: str) -> Path:
     return Path(__file__).resolve().parent / "assets" / name
 
 
-def create_plate(model, points_int: np.ndarray, plate_cfg: dict):
+def map_original_axis_side_to_internal(transform: np.ndarray, axis_name: str, side: str):
+    axis_orig = AXIS_TO_INDEX[axis_name]
+    column = transform[:, axis_orig]
+    axis_internal = int(np.argmax(np.abs(column)))
+    sign = float(column[axis_internal])
+    if sign >= 0.0:
+        side_internal = side
+    else:
+        side_internal = "max" if side == "min" else "min"
+    inv_axis = {v: k for k, v in AXIS_TO_INDEX.items()}
+    return inv_axis[axis_internal], side_internal
+
+
+
+def create_plate(model, collision_detection, points_int: np.ndarray, plate_cfg: dict, transform: np.ndarray):
     if not plate_cfg.get("enabled", False):
         return None
 
@@ -182,18 +215,30 @@ def create_plate(model, points_int: np.ndarray, plate_cfg: dict):
     maxs = points_int.max(axis=0)
     extents = np.maximum(maxs - mins, 1e-6)
 
-    side = plate_cfg.get("side", "min")
-    axis_name = plate_cfg.get("axis", "y")
+    if plate_cfg.get("axis_original"):
+        axis_name, side = map_original_axis_side_to_internal(
+            transform,
+            plate_cfg["axis_original"],
+            plate_cfg.get("side_original", plate_cfg.get("side", "min")),
+        )
+    else:
+        side = plate_cfg.get("side", "min")
+        axis_name = plate_cfg.get("axis", "y")
+
     axis = AXIS_TO_INDEX[axis_name]
     start_offset = float(plate_cfg.get("start_offset", 0.05))
     end_offset = float(plate_cfg.get("end_offset", start_offset))
     steps = max(0, int(plate_cfg.get("move_steps", 0)))
     move_start_step = max(0, int(plate_cfg.get("move_start_step", 0)))
 
-    scale_frac = np.asarray(plate_cfg.get("scale_fraction", [1.25, 0.04, 1.25]), dtype=np.float64)
-    scale = extents * scale_frac
-    scale[axis] = extents[axis] * float(plate_cfg.get("thickness_fraction", scale_frac[axis]))
-    scale[axis] = max(scale[axis], float(plate_cfg.get("min_thickness", 0.005)))
+    raw_scale = plate_cfg.get("scale_fraction", 1.25)
+    if isinstance(raw_scale, (list, tuple)):
+        tangent_fraction = max(float(v) for v in raw_scale)
+    else:
+        tangent_fraction = float(raw_scale)
+    scale = extents * tangent_fraction
+    thickness_fraction = float(plate_cfg.get("thickness_fraction", 0.04))
+    scale[axis] = max(extents[axis] * thickness_fraction, float(plate_cfg.get("min_thickness", 0.005)))
 
     center = 0.5 * (mins + maxs)
     start_pos = center.copy()
@@ -211,8 +256,8 @@ def create_plate(model, points_int: np.ndarray, plate_cfg: dict):
         start_pos,
         np.identity(3),
         scale,
-        testMesh=True,
-        generateCollisionObject=True,
+        testMesh=False,
+        generateCollisionObject=False,
         resolution=np.asarray(plate_cfg.get("resolution", [20, 10, 20]), dtype=np.uint32),
     )
     rb.setMass(0.0)
@@ -221,6 +266,26 @@ def create_plate(model, points_int: np.ndarray, plate_cfg: dict):
     rb.setVelocity(np.zeros(3, dtype=np.float64))
     rb.setVelocity0(np.zeros(3, dtype=np.float64))
     rb.setAcceleration(np.zeros(3, dtype=np.float64))
+    rb.setLastPosition(start_pos)
+    rb.setOldPosition(start_pos)
+    rb.setPosition0(start_pos)
+    rb.updateInverseTransformation()
+    rb.getGeometry().updateMeshTransformation(rb.getPosition(), rb.getRotationMatrix())
+    base_points_int = np.array(rb.getGeometry().getVertexData().getVertices(), dtype=np.float64, copy=True)
+    base_faces = build_faces(rb.getGeometry().getMesh())
+    if collision_detection is not None:
+        collision_box_scale = scale * float(plate_cfg.get("collision_box_scale", 1.0))
+        vdl = rb.getGeometry().getVertexDataLocal()
+        collision_detection.addCollisionBox(
+            len(model.getRigidBodies()) - 1,
+            pbd.CollisionObject.RigidBodyCollisionObjectType,
+            vdl,
+            0,
+            vdl.size(),
+            collision_box_scale,
+            bool(plate_cfg.get("collision_test_mesh", True)),
+            bool(plate_cfg.get("collision_invert_sdf", False)),
+        )
 
     return {
         "rb": rb,
@@ -232,6 +297,10 @@ def create_plate(model, points_int: np.ndarray, plate_cfg: dict):
         "side": side,
         "scale": scale,
         "obj": plate_obj,
+        "axis_original": plate_cfg.get("axis_original"),
+        "side_original": plate_cfg.get("side_original"),
+        "base_points_int": base_points_int,
+        "base_faces": base_faces,
     }
 
 
@@ -250,9 +319,12 @@ def update_plate_state(plate_state, step: int):
     pos = (1.0 - alpha) * plate_state["start_pos"] + alpha * plate_state["end_pos"]
     rb.setPosition(pos)
     rb.setPosition0(pos)
+    rb.setLastPosition(pos)
+    rb.setOldPosition(pos)
     rb.setVelocity(np.zeros(3, dtype=np.float64))
     rb.setVelocity0(np.zeros(3, dtype=np.float64))
     rb.setAcceleration(np.zeros(3, dtype=np.float64))
+    rb.updateInverseTransformation()
     rb.getGeometry().updateMeshTransformation(rb.getPosition(), rb.getRotationMatrix())
     return pos
 
@@ -261,10 +333,12 @@ def get_plate_render_state(plate_state, transform: np.ndarray):
     if plate_state is None:
         return None
     rb = plate_state["rb"]
-    rb.getGeometry().updateMeshTransformation(rb.getPosition(), rb.getRotationMatrix())
-    points = np.asarray(rb.getGeometry().getVertexData().getVertices(), dtype=np.float64) @ transform
-    faces = build_faces(rb.getGeometry().getMesh())
-    return {"points": points, "faces": faces}
+    pos = np.asarray(rb.getPosition(), dtype=np.float64)
+    rot = np.asarray(rb.getRotationMatrix(), dtype=np.float64)
+    local = plate_state["base_points_int"] - plate_state["start_pos"]
+    points_int = local @ rot.T + pos
+    points = points_int @ transform
+    return {"points": points, "faces": plate_state["base_faces"]}
 
 
 def run(cfg: dict) -> dict:
@@ -279,10 +353,18 @@ def run(cfg: dict) -> dict:
     sim = pbd.Simulation.getCurrent()
     sim.initDefault()
     model = sim.getModel()
+    timestep = sim.getTimeStep()
 
     plate_cfg = cfg.get("plate", {})
-    body_test_mesh = bool(cfg.get("test_mesh", False) or plate_cfg.get("enabled", False))
-    body_generate_collision = bool(cfg.get("generate_collision_object", False) or plate_cfg.get("enabled", False))
+    use_analytic_box_contact = bool(plate_cfg.get("enabled", False) and plate_cfg.get("collider_type", "analytic_box") == "analytic_box")
+    collision_detection = None
+    if use_analytic_box_contact:
+        collision_detection = pbd.DistanceFieldCollisionDetection()
+        timestep.setCollisionDetection(model, collision_detection)
+        collision_detection.setTolerance(float(cfg.get("collision_tolerance", 0.005)))
+
+    body_test_mesh = bool(cfg.get("test_mesh", False) and not use_analytic_box_contact)
+    body_generate_collision = bool(cfg.get("generate_collision_object", False) and not use_analytic_box_contact)
     collision_resolution = np.asarray(cfg.get("collision_resolution", [25, 25, 25]), dtype=np.uint32)
 
     tet_model = model.addTetModel(
@@ -312,21 +394,34 @@ def run(cfg: dict) -> dict:
         bool(cfg.get("normalize_shear", False)),
     )
 
-    timestep = sim.getTimeStep()
+    if collision_detection is not None:
+        collision_detection.addCollisionObjectWithoutGeometry(
+            0,
+            pbd.CollisionObject.TetModelCollisionObjectType,
+            particles,
+            tet_model.getIndexOffset(),
+            tet_model.getParticleMesh().numVertices(),
+            bool(cfg.get("body_collision_test_mesh", True)),
+        )
+
+    max_velocity_iterations = int(cfg.get("max_velocity_iterations", 0))
+    if plate_cfg.get("enabled", False) and max_velocity_iterations < 1:
+        max_velocity_iterations = 5
     timestep.setValueUInt(pbd.TimeStepController.NUM_SUB_STEPS, int(cfg.get("substeps", 5)))
     timestep.setValueUInt(pbd.TimeStepController.MAX_ITERATIONS, int(cfg.get("max_iterations", 1)))
-    timestep.setValueUInt(pbd.TimeStepController.MAX_ITERATIONS_V, int(cfg.get("max_velocity_iterations", 0)))
+    timestep.setValueUInt(pbd.TimeStepController.MAX_ITERATIONS_V, max_velocity_iterations)
     timestep.setValueInt(
         pbd.TimeStepController.VELOCITY_UPDATE_METHOD,
         int(cfg.get("velocity_update_method", pbd.TimeStepController.ENUM_VUPDATE_FIRST_ORDER)),
     )
     pbd.TimeManager.getCurrent().setTimeStepSize(float(cfg.get("dt", 0.002)))
 
-    plate_state = create_plate(model, points_int, plate_cfg)
+    plate_state = create_plate(model, collision_detection, points_int, plate_cfg, transform)
     if plate_state is not None:
         model.setContactStiffnessParticleRigidBody(float(cfg.get("contact_stiffness_particle_rigid", 1.0)))
         model.setContactStiffnessRigidBody(float(cfg.get("contact_stiffness_rigid", 1.0)))
-        timestep.getCollisionDetection().setTolerance(float(cfg.get("collision_tolerance", 0.005)))
+        if timestep.getCollisionDetection() is not None:
+            timestep.getCollisionDetection().setTolerance(float(cfg.get("collision_tolerance", 0.005)))
 
     render_cfg = cfg.get("render", {})
     record_dir = Path(render_cfg["record_dir"]) if render_cfg.get("record_dir") else None
@@ -338,9 +433,16 @@ def run(cfg: dict) -> dict:
     plotter = None
     current_poly = None
     plate_poly = None
+    camera_position = None
     if record_dir:
         ensure_empty_dir(record_dir)
-        plotter, current_poly, plate_poly = make_plotter(points_orig, surface_faces, render_cfg, get_plate_render_state(plate_state, transform))
+        plotter, current_poly, plate_poly, _plate_start_poly, camera_position = make_plotter(
+            points_orig,
+            surface_faces,
+            render_cfg,
+            get_plate_render_state(plate_state, transform),
+            get_plate_render_state(plate_state, transform),
+        )
 
     steps = int(cfg.get("steps", 150))
     vel_damp = float(cfg.get("velocity_damping", 1.0))
@@ -352,6 +454,9 @@ def run(cfg: dict) -> dict:
     failed = False
     fail_reason = None
     completed_steps = 0
+    max_particle_rigid_contacts = 0
+    max_rigid_body_contacts = 0
+    max_particle_solid_contacts = 0
     for step in range(steps):
         update_plate_state(plate_state, step)
         timestep.step(model)
@@ -363,6 +468,12 @@ def run(cfg: dict) -> dict:
         points_step = np.asarray(particles.getVertices(), dtype=np.float64) @ transform
         disp_step = points_step - points_orig
         completed_steps = step + 1
+        particle_rigid_contacts = len(model.getParticleRigidBodyContactConstraints())
+        rigid_body_contacts = len(model.getRigidBodyContactConstraints())
+        particle_solid_contacts = len(model.getParticleSolidContactConstraints())
+        max_particle_rigid_contacts = max(max_particle_rigid_contacts, particle_rigid_contacts)
+        max_rigid_body_contacts = max(max_rigid_body_contacts, rigid_body_contacts)
+        max_particle_solid_contacts = max(max_particle_solid_contacts, particle_solid_contacts)
         if not np.isfinite(points_step).all():
             failed = True
             fail_reason = "non_finite_positions"
@@ -377,11 +488,20 @@ def run(cfg: dict) -> dict:
             current_poly.points = points_step
             if plate_poly is not None:
                 plate_poly.points = get_plate_render_state(plate_state, transform)["points"]
-            plotter.camera_position = camera_from_bounds(current_poly.bounds, render_cfg.get("camera_y_side", "max"))
+            if render_cfg.get("lock_camera", True):
+                plotter.camera_position = camera_position
+            else:
+                plotter.camera_position = camera_from_bounds(current_poly.bounds, render_cfg.get("camera_y_side", "max"))
             status = f"XPBD step {step + 1}/{steps}"
             if plate_state is not None:
                 plate_pos = np.asarray(plate_state["rb"].getPosition(), dtype=np.float64)
-                status += f" | plate_{plate_state['axis']}={plate_pos[AXIS_TO_INDEX[plate_state['axis']]]:.4f}"
+                if plate_state.get("axis_original"):
+                    plate_pos_orig = plate_pos @ transform
+                    status += f" | plate_{plate_state['axis_original']}_orig={plate_pos_orig[AXIS_TO_INDEX[plate_state['axis_original']]]:.4f}"
+                else:
+                    status += f" | plate_{plate_state['axis']}={plate_pos[AXIS_TO_INDEX[plate_state['axis']]]:.4f}"
+            if plate_state is not None:
+                status += f" | pr_contacts={particle_rigid_contacts}"
             if failed:
                 status += f" | FAILED: {fail_reason}"
             plotter.add_text(status, position="upper_left", font_size=10, color="black", name="status_text")
@@ -405,6 +525,7 @@ def run(cfg: dict) -> dict:
         "steps_requested": steps,
         "steps_completed": completed_steps,
         "dt": float(cfg.get("dt", 0.002)),
+        "effective_max_velocity_iterations": int(max_velocity_iterations),
         "fixed_nodes": int(fixed_nodes.size),
         "max_disp": float(np.linalg.norm(disp, axis=1).max()),
         f"mean_{report_axis}_disp": float(axis_disp.mean()),
@@ -414,11 +535,20 @@ def run(cfg: dict) -> dict:
         "fail_reason": fail_reason,
         "record_dir": str(record_dir) if record_dir else None,
         "record_video": str(output_video) if output_video else None,
+        "max_particle_rigid_contacts": int(max_particle_rigid_contacts),
+        "max_rigid_body_contacts": int(max_rigid_body_contacts),
+        "max_particle_solid_contacts": int(max_particle_solid_contacts),
     }
     if plate_state is not None:
-        result["plate_start_pos_internal"] = plate_state["start_pos"].tolist()
-        result["plate_end_pos_internal"] = plate_state["end_pos"].tolist()
-        result["plate_final_pos_internal"] = np.asarray(plate_state["rb"].getPosition(), dtype=np.float64).tolist()
+        plate_start_internal = plate_state["start_pos"]
+        plate_end_internal = plate_state["end_pos"]
+        plate_final_internal = np.asarray(plate_state["rb"].getPosition(), dtype=np.float64)
+        result["plate_start_pos_internal"] = plate_start_internal.tolist()
+        result["plate_end_pos_internal"] = plate_end_internal.tolist()
+        result["plate_final_pos_internal"] = plate_final_internal.tolist()
+        result["plate_start_pos_original"] = (plate_start_internal @ transform).tolist()
+        result["plate_end_pos_original"] = (plate_end_internal @ transform).tolist()
+        result["plate_final_pos_original"] = (plate_final_internal @ transform).tolist()
 
     metadata_path = cfg.get("metadata_json")
     if metadata_path:
