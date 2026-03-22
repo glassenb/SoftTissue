@@ -1,0 +1,33 @@
+{
+  "tet_npz": "C:/dev/softtissue/Data/GM_STL/MRI/tet_mesh_gm_mri_p6.npz",
+  "unit_scale": 0.001,
+  "gravity_axis": "-z",
+  "report_axis": "z",
+  "fix_axis": "y",
+  "fix_side": "max",
+  "fix_frac": 0.3,
+  "solid_method": 6,
+  "stiffness": 100000.0,
+  "poisson_ratio": 0.3,
+  "volume_stiffness": 100000.0,
+  "steps": 80,
+  "dt": 0.002,
+  "substeps": 5,
+  "max_iterations": 1,
+  "max_velocity_iterations": 0,
+  "velocity_damping": 0.99,
+  "metadata_json": "C:/dev/softtissue/videos/xpbd_20260321_233200_gm_mri_p6_regression_m6.json",
+  "render": {
+    "record_dir": "C:/dev/softtissue/videos/frames_xpbd_20260321_233200_gm_mri_p6_regression_m6",
+    "record_video": "C:/dev/softtissue/videos/xpbd_20260321_233200_gm_mri_p6_regression_m6.mp4",
+    "record_every": 2,
+    "record_fps": 30,
+    "window_size": [1280, 960],
+    "background": "white",
+    "initial_color": "lightgray",
+    "initial_opacity": 0.18,
+    "current_color": "salmon",
+    "current_opacity": 0.75,
+    "camera_y_side": "min"
+  }
+}
