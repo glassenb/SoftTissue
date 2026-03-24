@@ -1,0 +1,17 @@
+diff --git a/physx/source/compiler/cmakegpu/CMakeLists.txt b/physx/source/compiler/cmakegpu/CMakeLists.txt
+index 625102d..a070218 100644
+--- a/physx/source/compiler/cmakegpu/CMakeLists.txt
++++ b/physx/source/compiler/cmakegpu/CMakeLists.txt
+@@ -85,10 +85,11 @@ SET(SOURCE_DISTRO_FILE_LIST "")
+ # since that's the default set in: compiler\internal\CMakeLists.txt (using CMAKE_CUDA_ARCHITECTURES)
+ # see policy CMP0104
+ IF(PX_GENERATE_GPU_REDUCED_ARCHITECTURES)
+-	GENERATE_ARCH_CODE_LIST(SASS "80,86,89,90,100,120" PTX "120")
++	# Local spike: CUDA 12.5 on this machine supports up to Hopper/Ada, not Blackwell.
++	GENERATE_ARCH_CODE_LIST(SASS "89" PTX "89")
+ ELSE()
+-	# Volta is the minimum compute arch required because NGC supports V100
+-	GENERATE_ARCH_CODE_LIST(SASS "70,80,86,89,90,100,120" PTX "120")
++	# Local spike: trim unsupported 10.0/12.0 architectures so CUDA 12.5 can build the GPU path.
++	GENERATE_ARCH_CODE_LIST(SASS "89" PTX "89")
+ ENDIF()

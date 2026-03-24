@@ -1,0 +1,14 @@
+build/
+data/
+outputs/
+third_party/
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.lib
+*.exp
+*.user
+*.VC.db
+__pycache__/
+*.pyc
